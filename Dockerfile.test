@@ -1,0 +1,84 @@
+# Sandbox for running the full test suite (unit + integration) and
+# producing coverage reports. The image is intentionally self-contained:
+# nothing here depends on the host beyond the source tree mounted in.
+#
+# Build:  docker build -t git-agecrypt-test -f Dockerfile.test .
+# Run:    docker run --rm -v "$PWD/coverage:/out" git-agecrypt-test
+#
+# On exit, ./coverage/ on the host contains:
+#   - html/index.html  : browseable line-by-line coverage
+#   - lcov.info        : machine-readable coverage for CI ingestion
+#   - summary.txt      : per-file table dump
+#   - test-output.txt  : raw cargo test output
+
+FROM rust:1.88-bookworm
+
+# git is needed both as a runtime dependency (LibGit2Repository shells out
+# to `git config --remove-section`) and by every integration test.
+# pkg-config + libssl-dev satisfy native bindings that some transitive
+# deps need to compile.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# cargo-llvm-cov plus the matching llvm-tools rustup component drive the
+# coverage instrumentation. Pinning a known-good llvm-cov version keeps
+# the report format stable in CI.
+RUN rustup component add llvm-tools-preview \
+    && cargo install --locked cargo-llvm-cov@0.6.11
+
+# Set git identity so any test that calls `git commit` works without
+# the test fixture having to configure user.name/email per-repo (we do
+# anyway, but having a global default is a useful belt-and-braces).
+RUN git config --global user.email "ci@git-agecrypt.test" \
+    && git config --global user.name "git-agecrypt CI" \
+    && git config --global init.defaultBranch main
+
+WORKDIR /work
+
+# Copy manifests first for layer caching: deps only rebuild when
+# Cargo.toml/Cargo.lock change.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
+    && cargo build --tests --quiet \
+    && rm -rf src target/debug/deps/git_agecrypt* target/debug/git-agecrypt*
+
+# Now bring in the real source tree.
+COPY src ./src
+COPY tests ./tests
+
+# Mountpoint for extracted reports. The runner script bind-mounts
+# the host's ./coverage directory here.
+RUN mkdir -p /out
+
+# The runner is invoked with --user $(id -u):$(id -g) so the artifacts
+# end up owned by the invoking host user. That requires the build tree
+# itself to be writable by any UID — this is an ephemeral test image,
+# so the loose permissions here have no security implication.
+RUN chmod -R 0777 /work /out \
+    && chmod -R 0777 /usr/local/cargo/registry /usr/local/rustup
+
+# The default command runs the full test suite under coverage
+# instrumentation and emits three artifacts:
+#   1. lcov.info          — for CI/code-review tooling
+#   2. html/              — for human inspection
+#   3. summary.txt        — quick CLI-friendly view
+# It also captures the raw test output alongside, so failures are
+# reproducible from the artifacts alone.
+CMD set -e \
+    && echo "=== cargo --version ===" \
+    && cargo --version \
+    && rustc --version \
+    && echo "=== running test suite under coverage instrumentation ===" \
+    && cargo llvm-cov clean --workspace \
+    && cargo llvm-cov --all --no-report 2>&1 | tee /out/test-output.txt \
+    && echo "=== producing reports ===" \
+    && cargo llvm-cov report --lcov --output-path /out/lcov.info \
+    && cargo llvm-cov report --html --output-dir /out \
+    && cargo llvm-cov report --summary-only > /out/summary.txt \
+    && cat /out/summary.txt \
+    && echo "=== reports written to /out ==="

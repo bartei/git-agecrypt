@@ -29,3 +29,13 @@ run:
 
 watch +COMMAND='ltest':
     cargo watch --ignore "*.profraw" --clear --exec "{{COMMAND}}"
+
+# Run the full test suite + coverage inside a sandboxed Docker container.
+# Reports land in ./coverage/ on the host.
+docker-test:
+    ./scripts/test-docker.sh
+
+# Local coverage run (no Docker), uses cargo-llvm-cov directly.
+coverage:
+    cargo llvm-cov --all --html --output-dir target/llvm-cov/html
+    cargo llvm-cov report --summary-only

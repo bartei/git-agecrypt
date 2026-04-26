@@ -21,18 +21,18 @@ impl<C: Context> CommandContext<C> {
         ensure_state(repo.set_config("filter.git-agecrypt.required", "true"))?;
         ensure_state(repo.set_config(
             "filter.git-agecrypt.smudge",
-            &format!("{} smudge -f %f", exe),
+            &format!("{exe} smudge -f %f"),
         ))?;
         ensure_state(
-            repo.set_config("filter.git-agecrypt.clean", &format!("{} clean -f %f", exe)),
+            repo.set_config("filter.git-agecrypt.clean", &format!("{exe} clean -f %f")),
         )?;
-        ensure_state(repo.set_config("diff.git-agecrypt.textconv", &format!("{} textconv", exe)))?;
+        ensure_state(repo.set_config("diff.git-agecrypt.textconv", &format!("{exe} textconv")))?;
         Ok(())
     }
 
     pub(crate) fn deinit(&self) -> Result<()> {
         let repo = self.ctx.repo();
-        ensure_state(repo.remove_config_section("fiter.git-agecrypt"))?;
+        ensure_state(repo.remove_config_section("filter.git-agecrypt"))?;
         ensure_state(repo.remove_config_section("diff.git-agecrypt"))?;
 
         self.ctx.remove_sidecar_files()?;
@@ -101,7 +101,7 @@ impl<C: Context> CommandContext<C> {
 
         println!("The following recipients are configured:");
         for (p, r) in recipients {
-            println!("    {}: {}", p, r);
+            println!("    {p}: {r}");
         }
         Ok(())
     }

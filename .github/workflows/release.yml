@@ -1,0 +1,145 @@
+name: Release
+
+# Triggered manually from the GitHub Actions UI. The operator picks a
+# semver bump (patch / minor / major); the workflow then:
+#   1. Runs the test suite as a release guard.
+#   2. Bumps the version in Cargo.toml, regenerates Cargo.lock, commits,
+#      tags `v<version>` and pushes both the commit and the tag.
+#   3. Creates a GitHub Release with auto-generated notes (commits since
+#      the previous tag).
+#   4. Builds release binaries for Linux (gnu + musl), macOS (Intel +
+#      Apple Silicon), and Windows, and uploads them to the release.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Semver bump'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+# `contents: write` is needed to push the version-bump commit, push the
+# tag, and create/edit the GitHub Release + upload binaries.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  prepare:
+    name: Test, bump, tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Need a token that can push back to the protected branch.
+          # GITHUB_TOKEN works as long as branch protection allows the
+          # github-actions bot; otherwise swap for a PAT secret.
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@git-agecrypt.test"
+          git config --global user.name "git-agecrypt CI"
+          git config --global init.defaultBranch main
+      - name: Run test suite (release guard)
+        run: cargo test --all --no-fail-fast
+      - name: Bump version, commit, tag and push
+        id: bump
+        run: |
+          set -euo pipefail
+          OLD=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
+          IFS=. read -r MAJ MIN PAT <<< "$OLD"
+          case "${{ inputs.bump }}" in
+            major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
+            minor) MIN=$((MIN+1)); PAT=0 ;;
+            patch) PAT=$((PAT+1)) ;;
+          esac
+          NEW="$MAJ.$MIN.$PAT"
+          echo "Bumping $OLD -> $NEW"
+
+          # Match the first `version =` line only (the one in [package]).
+          sed -i -E "0,/^version = \"$OLD\"/ s//version = \"$NEW\"/" Cargo.toml
+
+          # Update only the git-agecrypt entry in Cargo.lock — do not let
+          # transitive deps drift from what was just tested.
+          sed -i -E "/^name = \"git-agecrypt\"$/{N;s/version = \"$OLD\"/version = \"$NEW\"/}" Cargo.lock
+
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): v$NEW"
+          git tag -a "v$NEW" -m "git-agecrypt v$NEW"
+          git push origin HEAD --follow-tags
+
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Create GitHub Release
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+      - name: Create release with auto-generated notes
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [prepare, release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-13           # Intel runner
+            target: x86_64-apple-darwin
+          - os: macos-latest       # Apple Silicon runner
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        # musl-tools provides musl-gcc, needed for the musl target on
+        # ubuntu-latest (no cross-compile, just a different libc).
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Build & upload release binary
+        # taiki-e/upload-rust-binary-action handles: cargo build --release,
+        # archiving (.tar.gz on unix, .zip on windows), and uploading the
+        # archive to the release created in the previous job.
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: git-agecrypt
+          target: ${{ matrix.target }}
+          archive: $bin-$tag-$target
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          token: ${{ secrets.GITHUB_TOKEN }}

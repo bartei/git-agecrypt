@@ -19,8 +19,8 @@ pub(crate) fn decrypt(
     let id = id.iter().map(|i| i.as_ref() as &dyn Identity);
     let mut decrypted = vec![];
     let decryptor = match Decryptor::new(ArmoredReader::new(encrypted)) {
-        Ok(Decryptor::Recipients(d)) => d,
-        Ok(Decryptor::Passphrase(_)) => bail!("Passphrase encrypted files are not supported"),
+        Ok(d) if d.is_scrypt() => bail!("Passphrase encrypted files are not supported"),
+        Ok(d) => d,
         Err(DecryptError::InvalidHeader) => return Ok(None),
         Err(DecryptError::Io(e)) => {
             match e.kind() {
@@ -30,7 +30,7 @@ pub(crate) fn decrypt(
             }
         }
         Err(e) => {
-            println!("Error: {:?}", e);
+            log::error!("Decryption error: {e:?}");
             bail!(e)
         }
     };
@@ -47,7 +47,7 @@ fn load_identities(identities: &[impl AsRef<Path>]) -> Result<Vec<Box<dyn Identi
         .collect();
     let mut stdin_guard = StdinGuard::new(false);
     let rv = read_identities(id.clone(), None, &mut stdin_guard)
-        .with_context(|| format!("Loading identities failed from paths: {:?}", id))?;
+        .with_context(|| format!("Loading identities failed from paths: {id:?}"))?;
     Ok(rv)
 }
 
@@ -57,10 +57,10 @@ pub(crate) fn encrypt(
 ) -> Result<Vec<u8>> {
     let recipients = load_public_keys(public_keys)?;
 
-    let encryptor = Encryptor::with_recipients(recipients).with_context(|| {
+    let recipient_refs = recipients.iter().map(|r| r.as_ref() as &dyn Recipient);
+    let encryptor = Encryptor::with_recipients(recipient_refs).with_context(|| {
         format!(
-            "Couldn't load keys for recepients; public_keys={:?}",
-            public_keys
+            "Couldn't load keys for recipients; public_keys={public_keys:?}"
         )
     })?;
     let mut encrypted = vec![];

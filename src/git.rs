@@ -46,8 +46,6 @@ pub(crate) trait Repository {
 
     fn list_config(&self, key: &str) -> Result<Vec<String>>;
 
-    fn get_config(&self, key: &str) -> Result<String>;
-
     fn set_config(&self, key: &str, value: &str) -> Result<()>;
 
     fn remove_config_section(&self, key: &str) -> Result<()>;
@@ -70,6 +68,13 @@ impl LibGit2Repository {
         }
         Ok(Self { inner })
     }
+
+    #[cfg(test)]
+    fn get_config(&self, key: &str) -> Result<String> {
+        let cfg = self.inner.config()?;
+        cfg.get_string(key)
+            .map_err(|_e| Error::NotExist(key.into()))
+    }
 }
 
 impl Repository for LibGit2Repository {
@@ -89,10 +94,19 @@ impl Repository for LibGit2Repository {
                 self.workdir().display()
             )
         })?;
-        let entry = self
-            .inner
-            .head()
-            .context("Couldn not determine repository head")?
+        let head = match self.inner.head() {
+            Ok(h) => h,
+            // Fresh repository (no commits yet) — there is no prior version
+            // of the file to compare against.
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+                return Err(Error::NotExist(format!(
+                    "Path {} has no committed version (unborn branch)",
+                    relpath.display(),
+                )));
+            }
+            Err(e) => return Err(Error::Other(anyhow::anyhow!(e).context("Could not determine repository head"))),
+        };
+        let entry = head
             .peel_to_tree()?
             .get_path(relpath)
             .map_err(|e| match e.code() {
@@ -102,9 +116,11 @@ impl Repository for LibGit2Repository {
                 )),
                 _ => Error::Other(e.into()),
             })?;
-        let contents = entry.to_object(&self.inner)?;
-
-        Ok(contents.as_blob().unwrap().content().into())
+        let blob = entry
+            .to_object(&self.inner)?
+            .into_blob()
+            .map_err(|_| Error::NotExist(format!("Path {} is not a blob in HEAD", relpath.display())))?;
+        Ok(blob.content().into())
     }
 
     fn add_config(&self, key: &str, value: &str) -> Result<()> {
@@ -147,12 +163,6 @@ impl Repository for LibGit2Repository {
         })?;
 
         Ok(entries)
-    }
-
-    fn get_config(&self, key: &str) -> Result<String> {
-        let cfg = self.inner.config()?;
-        cfg.get_string(key)
-            .map_err(|_e| Error::NotExist(key.into()))
     }
 
     fn set_config(&self, key: &str, value: &str) -> Result<()> {

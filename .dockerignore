@@ -1,0 +1,6 @@
+# Don't haul host build artifacts into the build context.
+target/
+coverage/
+.git/
+.idea/
+*.profraw

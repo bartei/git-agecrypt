@@ -1,5 +1,13 @@
 # git-agecrypt
 
+[![CI](https://github.com/bartei/git-agecrypt/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bartei/git-agecrypt/actions/workflows/ci.yml)
+[![Audit](https://github.com/bartei/git-agecrypt/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/bartei/git-agecrypt/actions/workflows/audit.yml)
+[![Coverage](https://codecov.io/gh/bartei/git-agecrypt/branch/main/graph/badge.svg)](https://codecov.io/gh/bartei/git-agecrypt)
+[![Latest release](https://img.shields.io/github/v/release/bartei/git-agecrypt?sort=semver&display_name=tag)](https://github.com/bartei/git-agecrypt/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/bartei/git-agecrypt/total)](https://github.com/bartei/git-agecrypt/releases)
+[![License: MPL-2.0](https://img.shields.io/github/license/bartei/git-agecrypt)](./LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](https://www.rust-lang.org)
+
 Git integration usable to store encrypted secrets in the git repository while having the plaintext available in the working tree. An alternative to [git-crypt](https://github.com/AGWA/git-crypt) using [age](https://age-encryption.org) instead of GPG.
 
 Do not use this tool unless you understand the security implications. I am by no mean a security expert and this code hasn't been audited. Use at your own risk.
@@ -79,3 +87,7 @@ The following limitations can be easily improved upon, but they are not blockers
 - The application is started once for each file for every git operation. It can cause slowdown when the repository contains many encrypted files. A possible mitigation for this issue could be the implementation of the [long-running process protocol](https://github.com/git/git/blob/master/Documentation/technical/long-running-process-protocol.txt) but it is usable as it is for a couple of small files.
 
 - During encryption/decryption the whole file is loaded into memory. This can cause issues when encrypting large files.
+
+## Known security advisories (residual)
+
+The `age` crate transitively depends on `rsa` 0.9.x, which is affected by [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071) ("Marvin Attack" — potential key recovery through timing sidechannels). No upstream fix is currently available. This advisory only affects users who decrypt files for **SSH-RSA recipients**; users who only use x25519 (age native), ed25519 SSH keys, or age plugin recipients are not impacted.

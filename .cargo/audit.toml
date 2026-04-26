@@ -1,0 +1,12 @@
+# cargo-audit configuration. Used by both local `cargo audit` runs and the
+# CI audit job. Keep this list small and re-evaluate every time `age` or
+# `git2` is bumped, in case an upstream fix has finally landed.
+
+[advisories]
+ignore = [
+    # rsa 0.9.x — Marvin Attack timing sidechannel.
+    # No fix is available upstream as of 2026-04. Only impacts users who
+    # decrypt files for SSH-RSA recipients; x25519 / ed25519 / age plugin
+    # recipients are unaffected. Documented in README.md.
+    "RUSTSEC-2023-0071",
+]

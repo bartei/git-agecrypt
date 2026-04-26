@@ -1,0 +1,34 @@
+name: Audit
+
+# Runs cargo-audit on a schedule so newly-disclosed advisories are caught
+# even when there have been no commits to the repo. The same job also runs
+# in ci.yml for PR-time validation; this workflow exists primarily so the
+# README badge reflects "are we currently free of unresolved advisories?"
+# rather than "did the last PR build pass?".
+on:
+  schedule:
+    # 04:17 UTC every day — random offset to avoid the on-the-hour
+    # rush against the GitHub Actions queue.
+    - cron: '17 4 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/audit.toml'
+      - '.github/workflows/audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
