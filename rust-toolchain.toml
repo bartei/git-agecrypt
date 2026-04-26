@@ -1,0 +1,8 @@
+[toolchain]
+# 1.85 is the edition-2024 minimum, but transitive dependencies
+# (icu_* via idna via age) require 1.86, so 1.86 is the effective MSRV.
+# Any rustup-managed environment will auto-install this on `cd`,
+# keeping local builds aligned with the declared MSRV in Cargo.toml.
+channel = "1.86"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

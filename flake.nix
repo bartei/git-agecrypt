@@ -6,15 +6,17 @@
 
   outputs = { self, nixpkgs, flake-utils, ... }:
     {
-      overlay = final: prev: {
-        git-agecrypt = final.callPackage ./default.nix {};
+      # Modern flake schema uses `overlays.default`; the bare `overlay`
+      # attribute is deprecated and warns on every `nix flake check`.
+      overlays.default = final: _prev: {
+        git-agecrypt = final.callPackage ./default.nix { };
       };
     } //
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ self.overlay ];
+          overlays = [ self.overlays.default ];
         };
       in
       {
