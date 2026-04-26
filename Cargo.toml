@@ -8,12 +8,12 @@ edition = "2021"
 [dependencies]
 age = { version = "0.11.1", features = [ "cli-common", "armor", "ssh", "plugin" ] }
 anyhow = { version = "1.0.52", features = ["backtrace"] }
-blake3 = "1.3.3"
-clap = { version = "4.3.2", features = [ "derive" ] }
+blake3 = "1.8.5"
+clap = { version = "4.5.13", features = [ "derive" ] }
 env_logger = "0.11.3"
 git2 = { version = "0.20.0", default-features = false }
 log = "0.4.14"
-regex = "1.8.4"
+regex = "1.12.3"
 serde = { version = "1.0.133", features = [ "derive" ] }
 thiserror = "1.0.30"
 toml = "0.8.11"
