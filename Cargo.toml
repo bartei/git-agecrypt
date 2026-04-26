@@ -1,6 +1,6 @@
 [package]
 name = "git-agecrypt"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 # Edition 2024 needs Rust ≥ 1.85; transitive ICU crates (pulled via age →
 # idna) need 1.86, so 1.86 is the effective MSRV. Declared explicitly so
