@@ -95,7 +95,17 @@ impl<C: Context> CommandContext<C> {
 
     fn get_identities(&self) -> Result<Vec<String>> {
         log::debug!("Loading identities from config");
-        let all_identities = self.ctx.repo().list_config("identity")?;
+        // Go through the AgeIdentities container so the (anchored, namespaced)
+        // git-config lookup is shared with the rest of the CLI. The previous
+        // direct call to `list_config("identity")` matched any config entry
+        // whose name contained "identity" as a substring.
+        let all_identities: Vec<String> = self
+            .ctx
+            .age_identities()
+            .list()?
+            .into_iter()
+            .map(|i| i.path)
+            .collect();
         log::debug!(
             "Loaded identities from config; identities='{:?}'",
             all_identities

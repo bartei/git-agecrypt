@@ -73,10 +73,19 @@ where
     }
 
     fn list(&self) -> Result<Vec<Self::Item>> {
+        // libgit2 treats the pattern as a regex against the full config key
+        // name. Anchor it to the exact key we own; otherwise we'd accidentally
+        // match unrelated entries like `commit.gpgsign` or any other config
+        // option whose name happens to contain our namespace as a substring.
+        // (The original `&self.ns` form is what surfaced as
+        // `Loading identities failed from paths: ["false", ...]` on macOS CI
+        // — some runner-level entry contained "identity".)
+        let entry_name = format!("{}.{}", CONFIG_PATH, self.ns);
+        let pattern = format!("^{}$", regex::escape(&entry_name));
         Ok(self
             .ctx
             .repo()
-            .list_config(&self.ns)?
+            .list_config(&pattern)?
             .into_iter()
             .map(GitConfigEntry::new)
             .collect())

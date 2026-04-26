@@ -244,8 +244,16 @@ mod tests {
 
     #[rstest]
     fn test_repo_can_be_loaded(git_repo: Repo) -> Result<()> {
-        assert_eq!(git_repo.workdir(), git_repo.dir.path());
-        assert_eq!(git_repo.path(), git_repo.dir.join(".git"));
+        // libgit2 normalises symlinks (macOS `/var` → `/private/var`) and
+        // returns Windows paths with forward slashes / long-form usernames,
+        // so compare canonicalised forms rather than literal strings.
+        let workdir = std::fs::canonicalize(git_repo.workdir())?;
+        let tempdir = std::fs::canonicalize(git_repo.dir.path())?;
+        assert_eq!(workdir, tempdir);
+        assert_eq!(
+            std::fs::canonicalize(git_repo.path())?,
+            tempdir.join(".git"),
+        );
         Ok(())
     }
 
@@ -283,19 +291,17 @@ mod tests {
             .dir(git_repo.dir.path())
             .run()?;
 
-        assert_eq!(
-            git_repo.get_file_contents(&git_repo.dir.join(&path))?,
-            file_contents.as_bytes()
-        );
+        // Use the workdir libgit2 reports so prefix-stripping matches even
+        // when the underlying tempdir contains symlinked or short-form
+        // segments (macOS / Windows runners).
+        let abs = git_repo.workdir().join(&path);
+        assert_eq!(git_repo.get_file_contents(&abs)?, file_contents.as_bytes());
 
         repo_file.write_str("additional_contents")?;
-        assert_eq!(
-            git_repo.get_file_contents(&git_repo.dir.join(&path))?,
-            file_contents.as_bytes()
-        );
+        assert_eq!(git_repo.get_file_contents(&abs)?, file_contents.as_bytes());
 
         assert!(git_repo
-            .get_file_contents(git_repo.dir.path().parent().unwrap())
+            .get_file_contents(git_repo.workdir().parent().unwrap())
             .is_err());
 
         Ok(())

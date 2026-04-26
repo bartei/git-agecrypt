@@ -156,6 +156,19 @@ impl Fixture {
     fn add_identity(&self) {
         self.run_ok(&["config", "add", "-i", self.identity_path.to_str().unwrap()]);
     }
+
+    /// The identity path in the form it appears in stored / listed CLI
+    /// output. `AgeIdentity::try_from` normalises Windows backslashes to
+    /// forward slashes before storing in git config, so test assertions
+    /// must compare against the same canonical form.
+    fn identity_path_in_config(&self) -> String {
+        let s = self.identity_path.to_str().unwrap();
+        if cfg!(windows) {
+            s.replace('\\', "/")
+        } else {
+            s.to_string()
+        }
+    }
 }
 
 // ----- init / deinit -----
@@ -231,12 +244,16 @@ fn config_add_list_remove_identity() {
     fx.add_identity();
 
     let listed = fx.run_ok(&["config", "list", "-i"]);
-    assert!(listed.contains(fx.identity_path.to_str().unwrap()));
+    let needle = fx.identity_path_in_config();
+    assert!(
+        listed.contains(&needle),
+        "expected listed output to contain {needle:?}, got:\n{listed}"
+    );
     assert!(listed.contains("✓"), "valid identity should be marked ✓");
 
     fx.run_ok(&["config", "remove", "-i", fx.identity_path.to_str().unwrap()]);
     let after = fx.run_ok(&["config", "list", "-i"]);
-    assert!(!after.contains(fx.identity_path.to_str().unwrap()));
+    assert!(!after.contains(&needle));
 }
 
 #[test]
@@ -329,7 +346,7 @@ fn status_reports_configured_identities_and_recipients() {
     fx.write("secrets/a", "");
 
     let out = fx.run_ok(&["status"]);
-    assert!(out.contains(fx.identity_path.to_str().unwrap()));
+    assert!(out.contains(&fx.identity_path_in_config()));
     assert!(out.contains(&fx.public_key));
 }
 

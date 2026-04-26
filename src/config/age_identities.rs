@@ -12,13 +12,21 @@ impl TryFrom<PathBuf> for AgeIdentity {
     type Error = anyhow::Error;
 
     fn try_from(value: PathBuf) -> std::result::Result<Self, Self::Error> {
-        Ok(AgeIdentity {
-            path: String::from(
-                value
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("Unsupported path {:?}", &value))?,
-            ),
-        })
+        let s = value
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Unsupported path {:?}", &value))?;
+        // Git config values cannot contain raw backslashes — libgit2 treats
+        // them as escape introducers and rejects unknown sequences like
+        // `\U` with `class=Config (7) invalid escape …`. Both libgit2 and
+        // every age implementation accept forward slashes on Windows, so
+        // normalise here and store a single canonical form regardless of
+        // the host OS the entry was added on.
+        let normalized = if cfg!(windows) {
+            s.replace('\\', "/")
+        } else {
+            s.to_owned()
+        };
+        Ok(AgeIdentity { path: normalized })
     }
 }
 
