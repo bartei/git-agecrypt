@@ -4,7 +4,7 @@ use std::{
     process,
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -107,7 +107,7 @@ impl Repository for LibGit2Repository {
             Err(e) => {
                 return Err(Error::Other(
                     anyhow::anyhow!(e).context("Could not determine repository head"),
-                ))
+                ));
             }
         };
         let entry = head
@@ -205,8 +205,8 @@ mod tests {
     use std::ops::Deref;
 
     use anyhow::Result;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_matches::assert_matches;
     use duct::cmd;
     use rstest::fixture;
@@ -300,9 +300,11 @@ mod tests {
         repo_file.write_str("additional_contents")?;
         assert_eq!(git_repo.get_file_contents(&abs)?, file_contents.as_bytes());
 
-        assert!(git_repo
-            .get_file_contents(git_repo.workdir().parent().unwrap())
-            .is_err());
+        assert!(
+            git_repo
+                .get_file_contents(git_repo.workdir().parent().unwrap())
+                .is_err()
+        );
 
         Ok(())
     }

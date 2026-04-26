@@ -1,28 +1,34 @@
 [package]
 name = "git-agecrypt"
 version = "0.3.1"
-edition = "2021"
+edition = "2024"
+# Edition 2024 needs Rust ≥ 1.85; transitive ICU crates (pulled via age →
+# idna) need 1.86, so 1.86 is the effective MSRV. Declared explicitly so
+# cargo refuses to build on older toolchains.
+rust-version = "1.86"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 age = { version = "0.11.1", features = [ "cli-common", "armor", "ssh", "plugin" ] }
-anyhow = { version = "1.0.52", features = ["backtrace"] }
-blake3 = "1.3.3"
-clap = { version = "4.3.2", features = [ "derive" ] }
-env_logger = "0.11.3"
+anyhow = { version = "1.0.102", features = ["backtrace"] }
+blake3 = "1.8.5"
+clap = { version = "4.6.1", features = [ "derive" ] }
+env_logger = "0.11.10"
 git2 = { version = "0.20.0", default-features = false }
-log = "0.4.14"
-regex = "1.8.4"
-serde = { version = "1.0.133", features = [ "derive" ] }
-thiserror = "1.0.30"
-toml = "0.8.11"
+log = "0.4.29"
+regex = "1.12.3"
+serde = { version = "1.0.228", features = [ "derive" ] }
+thiserror = "2.0.18"
+toml = "1.1.2"
 
 [features]
 
 [dev-dependencies]
-age = { version = "0.11.1", features = ["armor"] }
-assert_fs = "1.0.6"
+# `age` is already a direct dependency (with `armor` enabled) — listing it
+# again under dev-dependencies was a leftover; cargo unions features across
+# dep tables, so the original duplicate had no effect on the build.
+assert_fs = "1.1.3"
 assert_matches = "1.5.0"
-duct = "0.13.5"
-rstest = "0.18.2"
+duct = "1.1.1"
+rstest = "0.26.1"

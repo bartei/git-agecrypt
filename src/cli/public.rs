@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::{git, Result};
+use crate::{Result, git};
 
 use crate::config::Validated;
 use crate::git::Repository;
@@ -16,7 +16,7 @@ impl<C: Context> CommandContext<C> {
     }
 
     pub(crate) fn init(&self) -> Result<()> {
-        let exe = self.ctx.current_exe()?;
+        let exe = shell_quote(&self.ctx.current_exe()?);
         let repo = self.ctx.repo();
         ensure_state(repo.set_config("filter.git-agecrypt.required", "true"))?;
         ensure_state(
@@ -111,5 +111,62 @@ fn ensure_state(result: git::Result<()>) -> Result<()> {
             git::Error::NotExist(_) => Ok(()),
             err => Err(anyhow::anyhow!(err)),
         },
+    }
+}
+
+/// Wrap a path for embedding into a `git config filter.*` command line.
+///
+/// Git invokes filter commands through `sh -c`, so the stored string is
+/// re-parsed by a POSIX shell (msys2 sh on Windows). Plain double quotes
+/// handle spaces; we additionally backslash-escape `\` and `"` so paths
+/// containing those characters round-trip safely.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' | '"' | '$' | '`' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn quote_wraps_simple_path() {
+        assert_eq!(
+            shell_quote("/usr/local/bin/git-agecrypt"),
+            "\"/usr/local/bin/git-agecrypt\""
+        );
+    }
+
+    #[test]
+    fn quote_handles_spaces() {
+        assert_eq!(
+            shell_quote("/Users/Some Body/git-agecrypt"),
+            "\"/Users/Some Body/git-agecrypt\"",
+        );
+    }
+
+    #[test]
+    fn quote_escapes_double_quote() {
+        assert_eq!(shell_quote(r#"weird"name"#), r#""weird\"name""#);
+    }
+
+    #[test]
+    fn quote_escapes_backslash_dollar_backtick() {
+        // sh would otherwise interpolate `$VAR`, run a `command` substitution,
+        // or treat `\` as an escape introducer.
+        assert_eq!(shell_quote(r"a\b"), r#""a\\b""#);
+        assert_eq!(shell_quote("$VAR"), r#""\$VAR""#);
+        assert_eq!(shell_quote("`cmd`"), r#""\`cmd\`""#);
     }
 }

@@ -191,6 +191,36 @@ fn init_writes_filter_and_diff_config() {
 }
 
 #[test]
+fn init_quotes_exe_path_in_filter_commands() {
+    // Paths with spaces (or other shell metacharacters) must round-trip
+    // through `sh -c` correctly. Verify that the stored filter command
+    // is a quoted form, so installs into e.g. `~/Application Support/`
+    // keep working.
+    let fx = Fixture::new();
+    fx.run_ok(&["init"]);
+    for key in [
+        "filter.git-agecrypt.smudge",
+        "filter.git-agecrypt.clean",
+        "diff.git-agecrypt.textconv",
+    ] {
+        let value = fx.git_config_get_all(key);
+        assert_eq!(value.len(), 1, "missing config for {key}");
+        assert!(
+            value[0].starts_with('"'),
+            "filter command for {key} must start with a double-quote so paths with spaces are shell-safe; got: {}",
+            value[0]
+        );
+        // The quoted form must close the quote before the subcommand,
+        // e.g. `"…/git-agecrypt" smudge -f %f`.
+        assert!(
+            value[0].matches('"').count() >= 2,
+            "filter command for {key} must contain a balanced pair of quotes; got: {}",
+            value[0]
+        );
+    }
+}
+
+#[test]
 fn init_is_idempotent() {
     let fx = Fixture::new();
     fx.run_ok(&["init"]);
@@ -207,18 +237,22 @@ fn deinit_removes_both_filter_and_diff_sections() {
     fx.run_ok(&["init"]);
     fx.run_ok(&["deinit"]);
 
-    assert!(fx
-        .git_config_get_all("filter.git-agecrypt.smudge")
-        .is_empty());
-    assert!(fx
-        .git_config_get_all("filter.git-agecrypt.clean")
-        .is_empty());
-    assert!(fx
-        .git_config_get_all("filter.git-agecrypt.required")
-        .is_empty());
-    assert!(fx
-        .git_config_get_all("diff.git-agecrypt.textconv")
-        .is_empty());
+    assert!(
+        fx.git_config_get_all("filter.git-agecrypt.smudge")
+            .is_empty()
+    );
+    assert!(
+        fx.git_config_get_all("filter.git-agecrypt.clean")
+            .is_empty()
+    );
+    assert!(
+        fx.git_config_get_all("filter.git-agecrypt.required")
+            .is_empty()
+    );
+    assert!(
+        fx.git_config_get_all("diff.git-agecrypt.textconv")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -454,4 +488,171 @@ fn smudge_rejects_unencrypted_input() {
         .run()
         .unwrap();
     assert!(!out.status.success());
+}
+
+#[test]
+fn textconv_passes_through_plaintext_working_copy() {
+    // textconv is invoked by git for both committed (encrypted) blobs and
+    // the working-copy (plaintext) version of a file. The plaintext path
+    // must round-trip unchanged so that diff output makes sense.
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    fx.write("secrets/note.txt", "plain working copy");
+    fx.add_recipient_for("note.txt");
+
+    // Run textconv directly against the unencrypted on-disk file.
+    let out = cmd(
+        agecrypt_bin(),
+        &[
+            "textconv",
+            &fx.workdir().join("secrets/note.txt").to_string_lossy(),
+        ],
+    )
+    .dir(fx.workdir())
+    .stdout_capture()
+    .stderr_capture()
+    .unchecked()
+    .run()
+    .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'),
+        "plain working copy"
+    );
+}
+
+#[test]
+fn config_remove_recipient_for_unknown_path_fails() {
+    // Removing a recipient for a path that was never registered must
+    // surface an error — silently no-oping would mask user typos.
+    let fx = Fixture::new();
+    let out = fx.run(&[
+        "config",
+        "remove",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "secrets/never-added",
+    ]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn config_remove_recipient_globally_clears_all_paths() {
+    // `config remove -r <r>` (no -p) should drop the recipient from every
+    // path it appears under and leave any other recipients in place.
+    let fx = Fixture::new();
+    fs::create_dir_all(fx.workdir().join("secrets")).unwrap();
+    fx.write("secrets/a", "");
+    fx.write("secrets/b", "");
+
+    let other_pk = age::x25519::Identity::generate().to_public().to_string();
+    fx.run_ok(&[
+        "config",
+        "add",
+        "-r",
+        &fx.public_key,
+        &other_pk,
+        "-p",
+        "secrets/a",
+        "secrets/b",
+    ]);
+
+    fx.run_ok(&["config", "remove", "-r", &fx.public_key]);
+
+    let listed = fx.run_ok(&["config", "list", "-r"]);
+    assert!(!listed.contains(&fx.public_key));
+    assert!(listed.contains(&other_pk));
+}
+
+#[test]
+fn config_remove_path_only_drops_path() {
+    // `config remove -p <p>` (no -r) should remove the path entry entirely.
+    let fx = Fixture::new();
+    fs::create_dir_all(fx.workdir().join("secrets")).unwrap();
+    fx.write("secrets/a", "");
+    fx.write("secrets/b", "");
+    fx.run_ok(&[
+        "config",
+        "add",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "secrets/a",
+        "secrets/b",
+    ]);
+    fx.run_ok(&["config", "remove", "-p", "secrets/a"]);
+
+    let listed = fx.run_ok(&["config", "list", "-r"]);
+    assert!(!listed.contains("secrets/a"));
+    assert!(listed.contains("secrets/b"));
+}
+
+#[test]
+fn deinit_without_init_is_noop() {
+    // `deinit` must be idempotent in the absence of prior init — same
+    // policy as `init` itself (existing-config errors are downgraded).
+    let fx = Fixture::new();
+    fx.run_ok(&["deinit"]);
+}
+
+#[test]
+fn config_remove_identity_that_was_never_added_fails() {
+    let fx = Fixture::new();
+    let out = fx.run(&["config", "remove", "-i", fx.identity_path.to_str().unwrap()]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn config_list_recipients_when_empty_succeeds() {
+    let fx = Fixture::new();
+    let out = fx.run_ok(&["config", "list", "-r"]);
+    assert!(out.contains("recipients"));
+}
+
+#[test]
+fn config_list_identities_when_empty_succeeds() {
+    let fx = Fixture::new();
+    let out = fx.run_ok(&["config", "list", "-i"]);
+    assert!(out.contains("identities"));
+}
+
+#[test]
+fn status_on_fresh_repo_does_not_error() {
+    // Status with nothing configured must still succeed and print
+    // both sections (just empty).
+    let fx = Fixture::new();
+    fx.run_ok(&["status"]);
+}
+
+#[test]
+fn invalid_subcommand_fails_with_clap_error() {
+    // Belt-and-braces: a missing subcommand should fail clap parsing
+    // rather than crashing the binary.
+    let out = cmd(agecrypt_bin(), &["this-is-not-a-command"])
+        .dir(std::env::temp_dir())
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn config_add_invalid_listed_marker_when_identity_breaks() {
+    // If a configured identity file goes missing or becomes garbage,
+    // `config list -i` must continue to work and mark it with `⨯`.
+    let fx = Fixture::new();
+    fx.add_identity();
+
+    // Corrupt the on-disk identity behind the configured path.
+    fs::write(&fx.identity_path, "no longer a valid identity").unwrap();
+
+    let listed = fx.run_ok(&["config", "list", "-i"]);
+    assert!(
+        listed.contains("⨯"),
+        "broken identity should be marked invalid; got:\n{listed}"
+    );
 }

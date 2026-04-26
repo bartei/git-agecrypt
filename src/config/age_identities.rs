@@ -2,7 +2,7 @@ use std::{fmt::Display, path::PathBuf};
 
 use anyhow::Context as AnyhowContext;
 
-use super::{git::GitConfigEntry, Container, Result, Validated};
+use super::{Container, Result, Validated, git::GitConfigEntry};
 
 pub(crate) struct AgeIdentity {
     pub path: String,
@@ -79,5 +79,56 @@ where
 {
     pub fn new(cfg: C) -> Self {
         Self(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_from_pathbuf_is_normalized_to_string() {
+        // On non-Windows the round-trip is a straight `PathBuf` → `String`.
+        // Just check that a UTF-8 path passes through.
+        let id = AgeIdentity::try_from(PathBuf::from("/tmp/key")).unwrap();
+        // Either unchanged on POSIX, or normalised forward-slash on Windows.
+        if cfg!(windows) {
+            assert!(!id.path.contains('\\'));
+        } else {
+            assert_eq!(id.path, "/tmp/key");
+        }
+    }
+
+    #[test]
+    fn try_from_normalises_windows_backslashes() {
+        // Even on POSIX hosts, exercising the input path keeps `Display`
+        // and the canonical-form policy in coverage.
+        let id = AgeIdentity::try_from(PathBuf::from(r"C:\Users\test\key")).unwrap();
+        if cfg!(windows) {
+            assert_eq!(id.path, "C:/Users/test/key");
+        } else {
+            // POSIX treats backslashes as literal filename chars; nothing
+            // to normalise.
+            assert!(id.path.contains('\\'));
+        }
+    }
+
+    #[test]
+    fn display_renders_inner_path() {
+        let id = AgeIdentity {
+            path: "/tmp/foo".into(),
+        };
+        assert_eq!(format!("{id}"), "/tmp/foo");
+    }
+
+    #[test]
+    fn validate_rejects_non_identity_file() {
+        let dir = assert_fs::TempDir::new().unwrap();
+        let p = dir.path().join("garbage");
+        std::fs::write(&p, "not an identity").unwrap();
+        let id = AgeIdentity {
+            path: p.to_string_lossy().into_owned(),
+        };
+        assert!(id.validate().is_err());
     }
 }

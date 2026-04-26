@@ -91,3 +91,37 @@ where
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_round_trips_through_string() {
+        let entry = GitConfigEntry::new("hello".into());
+        let s: String = entry.into();
+        assert_eq!(s, "hello");
+
+        let back: GitConfigEntry = s.into();
+        let s2: String = back.into();
+        assert_eq!(s2, "hello");
+    }
+
+    #[test]
+    fn git_error_already_exists_maps_to_super_already_exists() {
+        let err: super::super::Error = crate::git::Error::AlreadyExists("v".into()).into();
+        assert!(matches!(err, super::super::Error::AlreadyExists(s) if s == "v"));
+    }
+
+    #[test]
+    fn git_error_not_exist_maps_to_super_not_exist() {
+        let err: super::super::Error = crate::git::Error::NotExist("v".into()).into();
+        assert!(matches!(err, super::super::Error::NotExist(s) if s == "v"));
+    }
+
+    #[test]
+    fn git_error_other_maps_to_super_other() {
+        let err: super::super::Error = crate::git::Error::Other(anyhow::anyhow!("boom")).into();
+        assert!(matches!(err, super::super::Error::Other(_)));
+    }
+}

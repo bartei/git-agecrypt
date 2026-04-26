@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::{
     config::{AgeIdentities, AgeIdentity, AppConfig, Container, GitConfig},
@@ -43,7 +43,19 @@ impl<R: git::Repository> ContextWrapper<R> {
 
     fn get_sidecar(&self, path: &Path, extension: &str) -> Result<PathBuf> {
         let relpath = path.strip_prefix(self.repo.workdir())?;
-        let name = relpath.to_string_lossy().replace('/', "!");
+        // The sidecar filename has to round-trip back to this path on the
+        // next clean/smudge invocation, so a lossy UTF-8 conversion would
+        // silently collide entries (every non-UTF8 byte folds to U+FFFD).
+        // Reject explicitly instead.
+        let name = relpath
+            .to_str()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Path {} is not valid UTF-8; git-agecrypt requires UTF-8 paths",
+                    relpath.display()
+                )
+            })?
+            .replace('/', "!");
 
         let dir = self.sidecar_directory();
         fs::create_dir_all(&dir)?;
@@ -83,7 +95,6 @@ impl<R: git::Repository> Context for ContextWrapper<R> {
 
     fn current_exe(&self) -> Result<String> {
         let exe = std::env::current_exe()?;
-        let s = exe.to_string_lossy();
         // The exe path is embedded into `.git/config` as the filter / diff
         // driver command. git's config parser interprets backslashes as
         // escape introducers (`\n`, `\t`, …) and silently swallows unknown
@@ -91,6 +102,12 @@ impl<R: git::Repository> Context for ContextWrapper<R> {
         // `D:agit-agecrypttargetdebuggit-agecrypt.exe` and the spawn fails
         // with "command not found". Normalise to forward slashes; both
         // `git` and `cmd.exe` accept forward-slash paths on Windows.
+        let s = exe.to_str().with_context(|| {
+            format!(
+                "Executable path {} is not valid UTF-8; git filter commands cannot encode it",
+                exe.display()
+            )
+        })?;
         let normalized = if cfg!(windows) {
             s.replace('\\', "/")
         } else {
@@ -126,4 +143,130 @@ impl<R: git::Repository> Context for ContextWrapper<R> {
 
 pub(crate) fn new(repo: git::LibGit2Repository) -> impl Context<Repo = git::LibGit2Repository> {
     ContextWrapper::new(repo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal in-memory `Repository` so the sidecar tests can pin down
+    /// `workdir`/`path` without spinning up libgit2.
+    struct FakeRepo {
+        workdir: PathBuf,
+        gitdir: PathBuf,
+    }
+
+    impl git::Repository for FakeRepo {
+        fn workdir(&self) -> &Path {
+            &self.workdir
+        }
+        fn path(&self) -> &Path {
+            &self.gitdir
+        }
+        fn get_file_contents(&self, _: &Path) -> git::Result<Vec<u8>> {
+            unimplemented!()
+        }
+        fn add_config(&self, _: &str, _: &str) -> git::Result<()> {
+            unimplemented!()
+        }
+        fn contains_config(&self, _: &str, _: &str) -> bool {
+            unimplemented!()
+        }
+        fn remove_config(&self, _: &str, _: &str) -> git::Result<()> {
+            unimplemented!()
+        }
+        fn list_config(&self, _: &str) -> git::Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn set_config(&self, _: &str, _: &str) -> git::Result<()> {
+            unimplemented!()
+        }
+        fn remove_config_section(&self, _: &str) -> git::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    fn fake_ctx() -> (assert_fs::TempDir, ContextWrapper<FakeRepo>) {
+        let dir = assert_fs::TempDir::new().unwrap();
+        let workdir = dir.path().to_path_buf();
+        let gitdir = workdir.join(".git");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        let ctx = ContextWrapper::new(FakeRepo { workdir, gitdir });
+        (dir, ctx)
+    }
+
+    #[test]
+    fn sidecar_path_replaces_separators() {
+        let (dir, ctx) = fake_ctx();
+        let nested = dir.path().join("a/b/c.txt");
+        let p = ctx.get_sidecar(&nested, "age").unwrap();
+        // `/` (or platform separator) must be folded to `!` so each file
+        // gets a flat sidecar entry.
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.contains('!'), "expected '!' in sidecar name: {name}");
+        assert!(name.ends_with(".age"));
+    }
+
+    #[test]
+    fn sidecar_round_trips_through_store_load() {
+        let (dir, ctx) = fake_ctx();
+        let target = dir.path().join("secrets/note.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        ctx.store_sidecar(&target, "age", b"ciphertext").unwrap();
+        let loaded = ctx.load_sidecar(&target, "age").unwrap();
+        assert_eq!(loaded.as_deref(), Some(&b"ciphertext"[..]));
+    }
+
+    #[test]
+    fn load_sidecar_returns_none_when_missing() {
+        let (dir, ctx) = fake_ctx();
+        let target = dir.path().join("never-stored.txt");
+        let loaded = ctx.load_sidecar(&target, "age").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn remove_sidecar_files_is_idempotent_when_absent() {
+        let (_dir, ctx) = fake_ctx();
+        // No sidecar dir exists yet — must not error.
+        ctx.remove_sidecar_files().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_rejects_non_utf8_relpath() {
+        // On Unix paths can hold arbitrary bytes; lossy conversion would
+        // collide entries by folding to U+FFFD.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let (dir, ctx) = fake_ctx();
+        let bytes: &[u8] = b"weird-\xff\xfe.txt";
+        let mut path = dir.path().to_path_buf();
+        path.push(OsStr::from_bytes(bytes));
+
+        let err = ctx
+            .get_sidecar(&path, "age")
+            .expect_err("non-UTF8 relpath must error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not valid UTF-8"),
+            "error must mention UTF-8: {msg}"
+        );
+    }
+
+    #[test]
+    fn current_exe_returns_normalized_string() {
+        // Smoke test: in the test process the current_exe is the test
+        // binary path and is always valid UTF-8.
+        let (_dir, ctx) = fake_ctx();
+        let s = ctx.current_exe().unwrap();
+        if cfg!(windows) {
+            assert!(
+                !s.contains('\\'),
+                "windows must normalise to forward slashes"
+            );
+        }
+        assert!(!s.is_empty());
+    }
 }
