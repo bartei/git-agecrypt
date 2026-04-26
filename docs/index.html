@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>git-agecrypt — transparent encryption for git, powered by age</title>
+  <meta name="description" content="Transparent file-level encryption for files in a git repository, powered by age. A modern, portable replacement for git-crypt." />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="styles.css" />
+  <template id="__bundler_thumbnail">
+    <svg viewBox="0 0 160 160" xmlns="http://www.w3.org/2000/svg">
+      <rect width="160" height="160" fill="#1a1a1f"/>
+      <g transform="translate(40,40)">
+        <path d="M20 40 V28 a20 20 0 0 1 40 0 V40" stroke="#f0f0f4" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+        <line x1="40" y1="40" x2="40" y2="72" stroke="#f0f0f4" stroke-width="3.2" stroke-linecap="round"/>
+        <path d="M40 56 q8 0 8 -8 V44" stroke="#e8a83a" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+        <circle cx="40" cy="40" r="4.8" fill="#e8a83a"/>
+        <circle cx="48" cy="44" r="3.6" fill="#1a1a1f" stroke="#e8a83a" stroke-width="2"/>
+        <circle cx="40" cy="72" r="3.6" fill="#f0f0f4"/>
+      </g>
+    </svg>
+  </template>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script src="assets/data.js"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="assets/logos.jsx"></script>
+  <script type="text/babel" src="assets/terminal.jsx"></script>
+  <script type="text/babel" src="assets/app-top.jsx"></script>
+  <script type="text/babel" src="assets/app-mid.jsx"></script>
+  <script type="text/babel" src="assets/app-bottom.jsx"></script>
+  <script type="text/babel" src="assets/app-root.jsx"></script>
+</body>
+</html>

@@ -1,0 +1,54 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    # Only re-deploy when docs (or this workflow) actually change. Dependency
+    # bumps and source-only edits don't need to rebuild the site.
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# GitHub Pages serialises deployments per-environment anyway, but this stops
+# multiple in-flight runs from queuing up on top of each other.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+# `actions/deploy-pages@v4` requires these scopes on the deploy job's token.
+# Read-only is sufficient for the build job, so the permissions are scoped
+# per-job rather than at the workflow level.
+permissions: {}
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload site artifact
+        # The `docs/` directory is the entire site — JSX is transpiled in
+        # the browser by Babel Standalone, so no build step is needed.
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
