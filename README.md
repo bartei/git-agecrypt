@@ -8,6 +8,8 @@
 [![License: MPL-2.0](https://img.shields.io/github/license/bartei/git-agecrypt)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](https://www.rust-lang.org)
 
+**Website:** <https://bartei.github.io/git-agecrypt/>
+
 Transparent file-level encryption for files in a git repository, powered by [age](https://age-encryption.org). The plaintext stays in your working tree; the ciphertext is what travels through `git add`, `git push`, and ends up in the remote.
 
 `git-agecrypt` is a modern, portable replacement for [git-crypt](https://github.com/AGWA/git-crypt): same workflow, but using age instead of GPG. Recipients can be age x25519 keys, OpenSSH ed25519 / RSA keys, or any [age plugin](https://github.com/FiloSottile/awesome-age) recipient (e.g. YubiKey PIV via `age-plugin-yubikey`).
