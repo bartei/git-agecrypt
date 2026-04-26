@@ -75,21 +75,19 @@ jobs:
           git config --global user.email "ci@git-agecrypt.test"
           git config --global user.name "git-agecrypt CI"
           git config --global init.defaultBranch main
-      - name: Generate lcov report
-        run: cargo llvm-cov --all --lcov --output-path lcov.info
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
-      - name: Upload coverage artifact
-        # Always uploaded, regardless of whether Codecov credentials are
-        # configured — gives a per-run downloadable report.
+      - name: Generate lcov + summary
+        run: |
+          cargo llvm-cov --all --lcov --output-path lcov.info
+          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+      - name: Upload coverage artifacts
+        # Each CI run produces a downloadable lcov.info plus a per-file
+        # summary. No external coverage service is configured.
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-lcov
-          path: lcov.info
+          name: coverage
+          path: |
+            lcov.info
+            coverage-summary.txt
 
   audit:
     name: cargo-audit

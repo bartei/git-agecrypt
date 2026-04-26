@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/bartei/git-agecrypt/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bartei/git-agecrypt/actions/workflows/ci.yml)
 [![Audit](https://github.com/bartei/git-agecrypt/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/bartei/git-agecrypt/actions/workflows/audit.yml)
-[![Coverage](https://codecov.io/gh/bartei/git-agecrypt/branch/main/graph/badge.svg)](https://codecov.io/gh/bartei/git-agecrypt)
 [![Latest release](https://img.shields.io/github/v/release/bartei/git-agecrypt?sort=semver&display_name=tag)](https://github.com/bartei/git-agecrypt/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/bartei/git-agecrypt/total)](https://github.com/bartei/git-agecrypt/releases)
 [![License: MPL-2.0](https://img.shields.io/github/license/bartei/git-agecrypt)](./LICENSE)
@@ -431,7 +430,7 @@ $ just docker-test    # full test suite + coverage in a sandboxed container
 $ just coverage       # local coverage with cargo-llvm-cov
 ```
 
-CI runs `cargo fmt --check`, `cargo clippy -D warnings`, the test suite on Linux / macOS / Windows, `cargo audit`, and uploads coverage to Codecov.
+CI runs `cargo fmt --check`, `cargo clippy -D warnings`, the test suite on Linux / macOS / Windows, `cargo audit`, and produces a per-run coverage artifact (`lcov.info` + summary) downloadable from each green CI run.
 
 ## License
 
