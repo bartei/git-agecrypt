@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.86
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.86
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -48,7 +48,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.86
       - uses: Swatinem/rust-cache@v2
       - name: Configure git identity
         # Several integration tests shell out to `git commit`, which fails
@@ -63,9 +63,13 @@ jobs:
   coverage:
     name: coverage
     runs-on: ubuntu-latest
+    # Need write access to push the badge endpoint to the dedicated branch.
+    # All other jobs use the default read-only token.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.86
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
@@ -75,10 +79,76 @@ jobs:
           git config --global user.email "ci@git-agecrypt.test"
           git config --global user.name "git-agecrypt CI"
           git config --global init.defaultBranch main
-      - name: Generate lcov + summary
+      - name: Generate coverage data
+        # `--lcov` produces lcov.info for the artifact upload. We then run
+        # `report` twice more: once to print the human-readable summary
+        # into the GitHub Actions step summary, and once with
+        # `--fail-under-lines` to gate CI on a minimum threshold.
         run: |
           cargo llvm-cov --all --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only | tee coverage-summary.txt
+          cargo llvm-cov report --json --output-path coverage.json
+      - name: Render coverage in run summary
+        # Renders as a fenced markdown block on the workflow run page so
+        # reviewers can read coverage without downloading the artifact.
+        run: |
+          {
+            echo "## Coverage report"
+            echo
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Enforce minimum line coverage
+        # Fail CI if line coverage drops below 80%. The headline number is
+        # currently ~90%, so this leaves slack for legitimate dips while
+        # catching genuine regressions.
+        run: cargo llvm-cov report --fail-under-lines 80
+      - name: Build badge endpoint JSON
+        id: badge
+        run: |
+          PCT=$(jq -r '.data[0].totals.lines.percent' coverage.json)
+          # Round to nearest integer so the badge label stays compact.
+          PCT_INT=$(printf '%.0f' "$PCT")
+          if   [ "$PCT_INT" -ge 90 ]; then COLOR=brightgreen
+          elif [ "$PCT_INT" -ge 80 ]; then COLOR=green
+          elif [ "$PCT_INT" -ge 70 ]; then COLOR=yellowgreen
+          elif [ "$PCT_INT" -ge 60 ]; then COLOR=yellow
+          else                              COLOR=red
+          fi
+          mkdir -p _badge
+          cat > _badge/coverage.json <<EOF
+          {"schemaVersion":1,"label":"coverage","message":"${PCT_INT}%","color":"${COLOR}"}
+          EOF
+          echo "pct=${PCT_INT}" >> "$GITHUB_OUTPUT"
+      - name: Publish badge to coverage-badge branch
+        # Only on pushes to main — PR runs would otherwise rewrite the badge
+        # to reflect not-yet-merged code.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          BADGE_DIR=$(pwd)/_badge
+          # Work in a separate clone so this doesn't touch the main checkout.
+          git clone --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}" badge-repo
+          cd badge-repo
+          # Create or switch to the orphan branch carrying only the badge.
+          if git ls-remote --exit-code --heads origin coverage-badge >/dev/null; then
+            git fetch origin coverage-badge:coverage-badge
+            git checkout coverage-badge
+            git rm -rf . >/dev/null 2>&1 || true
+          else
+            git checkout --orphan coverage-badge
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          cp "${BADGE_DIR}/coverage.json" coverage.json
+          git add coverage.json
+          if git diff --cached --quiet; then
+            echo "No badge change to publish."
+          else
+            git commit -m "ci: refresh coverage badge to ${{ steps.badge.outputs.pct }}%"
+            git push origin coverage-badge
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Upload coverage artifacts
         # Each CI run produces a downloadable lcov.info plus a per-file
         # summary. No external coverage service is configured.
@@ -88,13 +158,15 @@ jobs:
           path: |
             lcov.info
             coverage-summary.txt
+            coverage.json
+            _badge/coverage.json
 
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.86
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
