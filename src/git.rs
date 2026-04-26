@@ -104,22 +104,24 @@ impl Repository for LibGit2Repository {
                     relpath.display(),
                 )));
             }
-            Err(e) => return Err(Error::Other(anyhow::anyhow!(e).context("Could not determine repository head"))),
+            Err(e) => {
+                return Err(Error::Other(
+                    anyhow::anyhow!(e).context("Could not determine repository head"),
+                ))
+            }
         };
         let entry = head
             .peel_to_tree()?
             .get_path(relpath)
             .map_err(|e| match e.code() {
-                git2::ErrorCode::NotFound => Error::NotExist(format!(
-                    "Path {} is not found in HEAD",
-                    relpath.display(),
-                )),
+                git2::ErrorCode::NotFound => {
+                    Error::NotExist(format!("Path {} is not found in HEAD", relpath.display(),))
+                }
                 _ => Error::Other(e.into()),
             })?;
-        let blob = entry
-            .to_object(&self.inner)?
-            .into_blob()
-            .map_err(|_| Error::NotExist(format!("Path {} is not a blob in HEAD", relpath.display())))?;
+        let blob = entry.to_object(&self.inner)?.into_blob().map_err(|_| {
+            Error::NotExist(format!("Path {} is not a blob in HEAD", relpath.display()))
+        })?;
         Ok(blob.content().into())
     }
 

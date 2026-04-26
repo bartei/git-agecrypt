@@ -19,13 +19,10 @@ impl<C: Context> CommandContext<C> {
         let exe = self.ctx.current_exe()?;
         let repo = self.ctx.repo();
         ensure_state(repo.set_config("filter.git-agecrypt.required", "true"))?;
-        ensure_state(repo.set_config(
-            "filter.git-agecrypt.smudge",
-            &format!("{exe} smudge -f %f"),
-        ))?;
         ensure_state(
-            repo.set_config("filter.git-agecrypt.clean", &format!("{exe} clean -f %f")),
+            repo.set_config("filter.git-agecrypt.smudge", &format!("{exe} smudge -f %f")),
         )?;
+        ensure_state(repo.set_config("filter.git-agecrypt.clean", &format!("{exe} clean -f %f")))?;
         ensure_state(repo.set_config("diff.git-agecrypt.textconv", &format!("{exe} textconv")))?;
         Ok(())
     }

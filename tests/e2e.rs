@@ -150,23 +150,11 @@ impl Fixture {
         if !p.exists() {
             fs::write(&p, "").unwrap();
         }
-        self.run_ok(&[
-            "config",
-            "add",
-            "-r",
-            &self.public_key,
-            "-p",
-            &full,
-        ]);
+        self.run_ok(&["config", "add", "-r", &self.public_key, "-p", &full]);
     }
 
     fn add_identity(&self) {
-        self.run_ok(&[
-            "config",
-            "add",
-            "-i",
-            self.identity_path.to_str().unwrap(),
-        ]);
+        self.run_ok(&["config", "add", "-i", self.identity_path.to_str().unwrap()]);
     }
 }
 
@@ -206,10 +194,18 @@ fn deinit_removes_both_filter_and_diff_sections() {
     fx.run_ok(&["init"]);
     fx.run_ok(&["deinit"]);
 
-    assert!(fx.git_config_get_all("filter.git-agecrypt.smudge").is_empty());
-    assert!(fx.git_config_get_all("filter.git-agecrypt.clean").is_empty());
-    assert!(fx.git_config_get_all("filter.git-agecrypt.required").is_empty());
-    assert!(fx.git_config_get_all("diff.git-agecrypt.textconv").is_empty());
+    assert!(fx
+        .git_config_get_all("filter.git-agecrypt.smudge")
+        .is_empty());
+    assert!(fx
+        .git_config_get_all("filter.git-agecrypt.clean")
+        .is_empty());
+    assert!(fx
+        .git_config_get_all("filter.git-agecrypt.required")
+        .is_empty());
+    assert!(fx
+        .git_config_get_all("diff.git-agecrypt.textconv")
+        .is_empty());
 }
 
 #[test]
@@ -238,12 +234,7 @@ fn config_add_list_remove_identity() {
     assert!(listed.contains(fx.identity_path.to_str().unwrap()));
     assert!(listed.contains("✓"), "valid identity should be marked ✓");
 
-    fx.run_ok(&[
-        "config",
-        "remove",
-        "-i",
-        fx.identity_path.to_str().unwrap(),
-    ]);
+    fx.run_ok(&["config", "remove", "-i", fx.identity_path.to_str().unwrap()]);
     let after = fx.run_ok(&["config", "list", "-i"]);
     assert!(!after.contains(fx.identity_path.to_str().unwrap()));
 }
@@ -281,14 +272,7 @@ fn config_add_list_remove_recipient() {
     assert!(listed.contains(&fx.public_key));
 
     // Removing one path should leave the other.
-    fx.run_ok(&[
-        "config",
-        "remove",
-        "-r",
-        &fx.public_key,
-        "-p",
-        "secrets/a",
-    ]);
+    fx.run_ok(&["config", "remove", "-r", &fx.public_key, "-p", "secrets/a"]);
     let after = fx.run_ok(&["config", "list", "-r"]);
     assert!(!after.contains("secrets/a"));
     assert!(after.contains("secrets/b"));
@@ -316,14 +300,7 @@ fn config_add_invalid_recipient_fails() {
     let fx = Fixture::new();
     fs::create_dir_all(fx.workdir().join("secrets")).unwrap();
     fx.write("secrets/a", "");
-    let out = fx.run(&[
-        "config",
-        "add",
-        "-r",
-        "not-a-public-key",
-        "-p",
-        "secrets/a",
-    ]);
+    let out = fx.run(&["config", "add", "-r", "not-a-public-key", "-p", "secrets/a"]);
     assert!(!out.status.success());
 }
 
@@ -366,7 +343,12 @@ fn clean_smudge_round_trip_via_git() {
     fx.write("secrets/secret.txt", "hello world");
     fx.add_recipient_for("secret.txt");
 
-    fx.git(&["add", ".gitattributes", "git-agecrypt.toml", "secrets/secret.txt"]);
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/secret.txt",
+    ]);
     fx.git(&["commit", "-m", "initial"]);
 
     // The blob in the git index/HEAD must be encrypted.
@@ -395,7 +377,12 @@ fn unchanged_file_does_not_re_encrypt() {
     fx.add_identity();
     fx.write("secrets/stable.txt", "stable content");
     fx.add_recipient_for("stable.txt");
-    fx.git(&["add", ".gitattributes", "git-agecrypt.toml", "secrets/stable.txt"]);
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/stable.txt",
+    ]);
     fx.git(&["commit", "-m", "first"]);
 
     let blob_before = fx.git(&["show", "HEAD:secrets/stable.txt"]);
@@ -416,7 +403,12 @@ fn textconv_decrypts_for_diff() {
     fx.add_identity();
     fx.write("secrets/diff.txt", "line one\nline two\n");
     fx.add_recipient_for("diff.txt");
-    fx.git(&["add", ".gitattributes", "git-agecrypt.toml", "secrets/diff.txt"]);
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/diff.txt",
+    ]);
     fx.git(&["commit", "-m", "v1"]);
 
     fx.write("secrets/diff.txt", "line one\nline two changed\n");
