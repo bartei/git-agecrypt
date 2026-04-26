@@ -83,8 +83,20 @@ impl<R: git::Repository> Context for ContextWrapper<R> {
 
     fn current_exe(&self) -> Result<String> {
         let exe = std::env::current_exe()?;
-        let exe = exe.to_string_lossy();
-        Ok(exe.into())
+        let s = exe.to_string_lossy();
+        // The exe path is embedded into `.git/config` as the filter / diff
+        // driver command. git's config parser interprets backslashes as
+        // escape introducers (`\n`, `\t`, …) and silently swallows unknown
+        // escapes — `D:\a\git-agecrypt\…\git-agecrypt.exe` round-trips as
+        // `D:agit-agecrypttargetdebuggit-agecrypt.exe` and the spawn fails
+        // with "command not found". Normalise to forward slashes; both
+        // `git` and `cmd.exe` accept forward-slash paths on Windows.
+        let normalized = if cfg!(windows) {
+            s.replace('\\', "/")
+        } else {
+            s.to_string()
+        };
+        Ok(normalized)
     }
 
     fn remove_sidecar_files(&self) -> Result<()> {
