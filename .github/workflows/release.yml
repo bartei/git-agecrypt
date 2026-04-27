@@ -113,9 +113,15 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-          - os: macos-13           # Intel runner
+          # GitHub retired the dedicated Intel macOS runner (`macos-13`).
+          # Cross-compile both Apple targets from the same Apple-Silicon
+          # runner — `rustup target add x86_64-apple-darwin` plus the
+          # universal Apple SDK make this a no-op for our deps (we already
+          # build git2 with `default-features = false`, so there's no
+          # openssl/libssh2 cross-compile pain).
+          - os: macos-latest
             target: x86_64-apple-darwin
-          - os: macos-latest       # Apple Silicon runner
+          - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc

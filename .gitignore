@@ -11,3 +11,7 @@
 
 # IDE / editor scratch
 /.idea/
+
+# Local AI assistant config (not part of the project)
+/.claude/
+/CLAUDE.md
