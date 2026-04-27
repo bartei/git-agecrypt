@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
       - name: Upload site artifact
         # The `docs/` directory is the entire site — JSX is transpiled in
         # the browser by Babel Standalone, so no build step is needed.
