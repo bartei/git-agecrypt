@@ -11,7 +11,7 @@
 #   - summary.txt      : per-file table dump
 #   - test-output.txt  : raw cargo test output
 
-FROM rust:1.88-bookworm
+FROM rust:1.95-bookworm
 
 # git is needed both as a runtime dependency (LibGit2Repository shells out
 # to `git config --remove-section`) and by every integration test.
