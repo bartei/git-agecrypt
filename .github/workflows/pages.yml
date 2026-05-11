@@ -34,7 +34,7 @@ jobs:
       - name: Upload site artifact
         # The `docs/` directory is the entire site — JSX is transpiled in
         # the browser by Babel Standalone, so no build step is needed.
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs
 
