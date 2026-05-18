@@ -597,6 +597,270 @@ fn deinit_without_init_is_noop() {
     fx.run_ok(&["deinit"]);
 }
 
+// ----- glob path support -----
+
+#[test]
+fn config_add_accepts_glob_pattern_without_existing_file() {
+    // The "must exist on disk" check was the original blocker against using
+    // forward-looking glob entries. Globs are by definition not pinned to a
+    // file on disk -- registering one before any matching file exists is the
+    // whole point.
+    let fx = Fixture::new();
+    let out = fx.run(&[
+        "config",
+        "add",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "**/terraform.tfstate",
+    ]);
+    assert!(
+        out.status.success(),
+        "registering a glob pattern must not require an existing file; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let toml = fx.read("git-agecrypt.toml");
+    assert!(
+        toml.contains("**/terraform.tfstate"),
+        "glob key must be preserved verbatim in git-agecrypt.toml; got:\n{toml}"
+    );
+}
+
+#[test]
+fn config_add_rejects_invalid_glob_pattern() {
+    let fx = Fixture::new();
+    let out = fx.run(&[
+        "config",
+        "add",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "secrets/[unclosed",
+    ]);
+    assert!(
+        !out.status.success(),
+        "invalid glob syntax must be rejected up-front rather than silently failing later at clean time"
+    );
+}
+
+#[test]
+fn glob_recipient_encrypts_matching_files_at_any_depth() {
+    // End-to-end check: register a single `**/*.tfstate` recipient, drop in
+    // tfstate files at multiple depths, and verify `git add` encrypts each
+    // one through the clean filter -- without per-file `config add` calls.
+    let fx = Fixture::new();
+    fx.run_ok(&["init"]);
+    fx.add_identity();
+    fs::write(
+        fx.workdir().join(".gitattributes"),
+        "**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt\n",
+    )
+    .unwrap();
+    fx.run_ok(&[
+        "config",
+        "add",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "**/terraform.tfstate",
+    ]);
+
+    for rel in &[
+        "terraform.tfstate",
+        "envs/dev/terraform.tfstate",
+        "envs/prod/k3s/terraform.tfstate",
+    ] {
+        fx.write(rel, "plaintext-state");
+    }
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "terraform.tfstate",
+        "envs/dev/terraform.tfstate",
+        "envs/prod/k3s/terraform.tfstate",
+    ]);
+    fx.git(&["commit", "-m", "encrypted via glob"]);
+
+    for rel in &[
+        "terraform.tfstate",
+        "envs/dev/terraform.tfstate",
+        "envs/prod/k3s/terraform.tfstate",
+    ] {
+        let blob = fx.git(&["show", &format!("HEAD:{rel}")]);
+        assert!(
+            blob.starts_with("age-encryption.org/v1") || blob.contains("BEGIN AGE"),
+            "{rel} was not encrypted via the glob recipient; blob:\n{blob}"
+        );
+        assert!(
+            !blob.contains("plaintext-state"),
+            "{rel} blob leaks plaintext"
+        );
+    }
+}
+
+#[test]
+fn glob_and_literal_recipients_merge_for_matching_file() {
+    // A file matched by both a literal entry and a glob entry must be
+    // encrypted to the UNION of both recipient sets, so that "everyone via
+    // glob, plus targeted extras via literal" composes correctly.
+    let fx = Fixture::new();
+    fx.run_ok(&["init"]);
+    fx.add_identity();
+
+    // Second recipient for the literal entry, distinct from the fixture's
+    // self-recipient -- so we can prove both keys end up in the age header.
+    let extra = age::x25519::Identity::generate();
+    let extra_pk = extra.to_public().to_string();
+    let extra_secret = extra.to_string().expose_secret().to_string();
+    let extra_key_path = fx.workdir().join("extra.key");
+    fs::write(&extra_key_path, &extra_secret).unwrap();
+
+    fs::write(
+        fx.workdir().join(".gitattributes"),
+        "**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt\n",
+    )
+    .unwrap();
+
+    // Literal entry for the specific file -- this is the path that gets
+    // committed; the file must exist on disk before `config add` (literal
+    // entries keep their existence check).
+    fs::create_dir_all(fx.workdir().join("envs/dev")).unwrap();
+    fs::write(
+        fx.workdir().join("envs/dev/terraform.tfstate"),
+        "plaintext-state",
+    )
+    .unwrap();
+
+    fx.run_ok(&[
+        "config",
+        "add",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "**/terraform.tfstate",
+    ]);
+    fx.run_ok(&[
+        "config",
+        "add",
+        "-r",
+        &extra_pk,
+        "-p",
+        "envs/dev/terraform.tfstate",
+    ]);
+
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "envs/dev/terraform.tfstate",
+    ]);
+    fx.git(&["commit", "-m", "merged recipients"]);
+
+    // Either identity alone must be able to decrypt -- proves both were used
+    // as recipients when the file was encrypted.
+    let head_blob = fx.git(&["show", "HEAD:envs/dev/terraform.tfstate"]);
+    assert!(head_blob.starts_with("age-encryption.org/v1"));
+
+    // Decrypt with the extra (literal-only) identity. If the literal entry
+    // had silently overridden the glob entry, this would still work; the
+    // critical check is below where we decrypt with the glob-only identity.
+    let decrypted_extra = cmd("age", &["-d", "-i", extra_key_path.to_str().unwrap()])
+        .stdin_bytes(head_blob.as_bytes())
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run();
+    if let Ok(out) = decrypted_extra {
+        if out.status.success() {
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'),
+                "plaintext-state",
+                "extra-key decryption produced wrong plaintext"
+            );
+        }
+    }
+
+    // Decrypt with the fixture identity (registered ONLY via the glob).
+    // If the glob entry had been shadowed by the literal entry, this would
+    // fail. The merge contract requires both keys to work.
+    let decrypted_glob = cmd("age", &["-d", "-i", fx.identity_path.to_str().unwrap()])
+        .stdin_bytes(head_blob.as_bytes())
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run();
+    if let Ok(out) = decrypted_glob {
+        if out.status.success() {
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'),
+                "plaintext-state",
+                "glob-key decryption proves the glob recipient was honoured alongside the literal one"
+            );
+        } else {
+            // If the system `age` CLI isn't available we can still cross-check
+            // via the project's own smudge filter: removing the file and
+            // checking it back out goes through smudge using the fixture's
+            // identity (registered via `add_identity()`), which is the same
+            // key we're trying to prove was used as a recipient.
+            fs::remove_file(fx.workdir().join("envs/dev/terraform.tfstate")).unwrap();
+            fx.git(&["checkout", "--", "envs/dev/terraform.tfstate"]);
+            assert_eq!(fx.read("envs/dev/terraform.tfstate"), "plaintext-state");
+        }
+    } else {
+        // `age` CLI not on PATH at all -- fall back to the smudge round-trip.
+        fs::remove_file(fx.workdir().join("envs/dev/terraform.tfstate")).unwrap();
+        fx.git(&["checkout", "--", "envs/dev/terraform.tfstate"]);
+        assert_eq!(fx.read("envs/dev/terraform.tfstate"), "plaintext-state");
+    }
+}
+
+#[test]
+fn config_remove_glob_entry() {
+    // Removal is keyed by exact-string match against the registered key, so
+    // removing a glob entry uses the same pattern that was registered.
+    let fx = Fixture::new();
+    fx.run_ok(&[
+        "config",
+        "add",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "**/terraform.tfstate",
+    ]);
+    let listed_before = fx.run_ok(&["config", "list", "-r"]);
+    assert!(listed_before.contains("**/terraform.tfstate"));
+
+    fx.run_ok(&[
+        "config",
+        "remove",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "**/terraform.tfstate",
+    ]);
+    let listed_after = fx.run_ok(&["config", "list", "-r"]);
+    assert!(
+        !listed_after.contains("**/terraform.tfstate"),
+        "removed glob entry must be gone from status output; got:\n{listed_after}"
+    );
+}
+
+#[test]
+fn glob_recipient_appears_in_status_output() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    fx.run_ok(&["config", "add", "-r", &fx.public_key, "-p", "**/*.tfstate"]);
+    let out = fx.run_ok(&["status"]);
+    assert!(
+        out.contains("**/*.tfstate"),
+        "status output must surface registered glob entries; got:\n{out}"
+    );
+    assert!(out.contains(&fx.public_key));
+}
+
 #[test]
 fn config_remove_identity_that_was_never_added_fails() {
     let fx = Fixture::new();

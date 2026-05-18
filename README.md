@@ -18,7 +18,7 @@ Transparent file-level encryption for files in a git repository, powered by [age
 
 - **Encryption is transparent.** Once configured, regular `git add` / `git commit` / `git push` / `git pull` / `git diff` work as usual — files are encrypted on the way into the index and decrypted on checkout.
 - **Multi-recipient.** Encrypt a file to any number of recipients; any single matching identity decrypts it.
-- **Per-path policy.** Different files can be encrypted to different recipient sets, configured in a single committed `git-agecrypt.toml`.
+- **Per-path policy.** Different files can be encrypted to different recipient sets, configured in a single committed `git-agecrypt.toml`. Paths can be literal filenames or [glob patterns](#glob-path-patterns) like `**/terraform.tfstate`.
 - **Key rotation friendly.** Add or remove recipients without rewriting history; the next commit re-encrypts only what changed.
 - **Hardware key support.** Use age plugin recipients to keep the long-lived secret on a YubiKey or another secure element.
 - **Stable ciphertext.** Re-running `git status` / `git add` against an unchanged plaintext doesn't churn the encrypted blob — a blake3 sidecar makes the encrypted output deterministic relative to the working copy.
@@ -189,6 +189,11 @@ The following identities are currently configured:
 
 Registers one or more **public** keys (recipients) that should be able to decrypt one or more **paths**. Both `-r` and `-p` accept multiple values; you can also repeat the command per recipient. The mapping lives in a committed `git-agecrypt.toml` at the repo root, so collaborators inherit it on clone.
 
+A `<path>` argument can be either:
+
+- A **literal repo-relative path** (e.g. `secrets/api-token`) — the file must exist on disk when registered.
+- A **glob pattern** (e.g. `**/terraform.tfstate`, `secrets/*.env`, `config/[ab]/*.yaml`) — matches files that may not exist yet. See [Glob path patterns](#glob-path-patterns) below.
+
 Recipients can be:
 
 - An age native public key: `age1…`
@@ -206,12 +211,63 @@ $ git-agecrypt config add \
     -r age1qz5y…0p7w \
     -p secrets/api-token secrets/db.env config/prod.env
 
+# Encrypt every terraform state file in the repo (today and tomorrow)
+# to the same recipient — no per-file registration needed
+$ git-agecrypt config add \
+    -r age1qz5y…0p7w \
+    -p '**/terraform.tfstate'
+
 # Encrypt one file to several recipients (alice, bob, ci)
 $ git-agecrypt config add \
     -r age1qz5y…0p7w \
     -r age1jrnk…2qzp \
     -r age1ci8m…lkpw \
     -p secrets/api-token
+```
+
+### Glob path patterns
+
+Path entries in `git-agecrypt.toml` can be glob patterns instead of literal filenames. This is convenient for "every file that matches this shape should be encrypted to these recipients" rules — terraform state files, per-env secrets, generated key bundles, etc.
+
+Supported syntax (matches `.gitignore` / `gitattributes` conventions, parsed by [`globset`](https://crates.io/crates/globset)):
+
+| Pattern | Matches |
+|---|---|
+| `*` | any sequence of characters except `/` |
+| `**` | any sequence of characters, **including `/`** (use for "at any depth") |
+| `?` | a single non-`/` character |
+| `[abc]` | one character from a set |
+| `[a-z]` | one character from a range |
+
+Examples:
+
+```console
+# Every terraform.tfstate file in the repo, at any depth.
+$ git-agecrypt config add -r age1qz5y…0p7w -p '**/terraform.tfstate'
+
+# Every *.env file directly under secrets/ (not nested).
+$ git-agecrypt config add -r age1qz5y…0p7w -p 'secrets/*.env'
+
+# Every YAML file under any env directory.
+$ git-agecrypt config add -r age1qz5y…0p7w -p 'envs/*/*.yaml'
+```
+
+Resulting `git-agecrypt.toml`:
+
+```toml
+[config]
+"**/terraform.tfstate" = ["age1qz5y…0p7w"]
+"secrets/*.env"        = ["age1qz5y…0p7w"]
+```
+
+**Resolution semantics.** When a file is being encrypted, `git-agecrypt` collects the **union** of recipients from every entry whose key matches it — literal or glob. So a `**/terraform.tfstate` entry plus a specific `dev/terraform.tfstate` entry both contribute their recipients; the file is encrypted to both sets.
+
+**Glob entries don't need an existing file.** Registering `**/terraform.tfstate` works on day one, before any state file has been generated. The first `git add` of a matching file picks up the rule automatically.
+
+**Glob entries pair with `.gitattributes` exactly as literal entries do.** `.gitattributes` decides *which* paths run through the filter; `git-agecrypt.toml` decides *who they're encrypted for*. Both files need to agree:
+
+```gitattributes
+**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt
 ```
 
 After the first `config add`, edit `.gitattributes` (a regular committed file) so git knows which paths use this filter:
@@ -226,7 +282,7 @@ config/*.env        filter=git-agecrypt diff=git-agecrypt
 
 ### `git-agecrypt config remove -r <recipient>` — remove a recipient
 
-Drop a recipient from one or more paths, or from every path it currently appears in. Removing a recipient does **not** rewrite history or re-encrypt existing blobs; it takes effect on the next change to each affected file.
+Drop a recipient from one or more paths, or from every path it currently appears in. Removing a recipient does **not** rewrite history or re-encrypt existing blobs; it takes effect on the next change to each affected file. Glob entries are removed by passing the same pattern that was registered.
 
 ```console
 # Drop bob from secrets/api-token only

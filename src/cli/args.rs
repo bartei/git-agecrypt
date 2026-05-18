@@ -70,7 +70,9 @@ pub struct AddConfig {
     #[arg(short, long, num_args = 1.., group = "config")]
     recipient: Option<Vec<String>>,
 
-    /// Path to encrypt for the given recipient
+    /// Path or glob to encrypt for the given recipient (e.g. `secrets/api-token`
+    /// or `**/terraform.tfstate`). Literal paths must exist on disk; glob
+    /// patterns are accepted without an existing file.
     #[arg(short, long, num_args = 1..)]
     path: Option<Vec<PathBuf>>,
 }

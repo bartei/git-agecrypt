@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "git-agecrypt"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "age",
  "anyhow",
@@ -898,6 +898,7 @@ dependencies = [
  "duct",
  "env_logger",
  "git2",
+ "globset",
  "log",
  "regex",
  "rstest",

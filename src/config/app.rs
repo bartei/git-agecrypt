@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
+use globset::Glob;
 use serde::{Deserialize, Serialize};
 
 use crate::age;
@@ -18,6 +19,14 @@ pub struct AppConfig {
     path: PathBuf,
     #[serde(skip)]
     prefix: PathBuf,
+}
+
+/// A path entry in `git-agecrypt.toml` is treated as a glob pattern when it
+/// contains any of the standard glob meta-characters. Patterns without these
+/// characters keep behaving exactly as before (literal exact match), so
+/// existing configurations don't see any change.
+fn is_glob(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[')
 }
 
 impl AppConfig {
@@ -52,11 +61,31 @@ impl AppConfig {
 
     pub fn add(&mut self, recipients: Vec<String>, paths: Vec<PathBuf>) -> Result<()> {
         age::validate_public_keys(&recipients)?;
-        let invalid_paths: Vec<String> = paths
-            .iter()
-            .filter(|&p| !p.is_file())
-            .map(|f| f.to_string_lossy().to_string())
-            .collect();
+
+        // Validate that glob patterns parse, and that literal paths refer to
+        // files that actually exist. Glob entries by definition don't have to
+        // resolve to anything on disk -- they cover files that may show up
+        // later (e.g. `**/terraform.tfstate` registered before any state file
+        // has been generated).
+        let mut invalid_paths: Vec<String> = Vec::new();
+        let mut bad_globs: Vec<String> = Vec::new();
+        for p in &paths {
+            let s = p.to_string_lossy();
+            if is_glob(&s) {
+                if let Err(e) = Glob::new(&s) {
+                    bad_globs.push(format!("{s} ({e})"));
+                }
+            } else if !p.is_file() {
+                invalid_paths.push(s.into_owned());
+            }
+        }
+        if !bad_globs.is_empty() {
+            return Err(anyhow!(
+                "The following glob patterns are invalid: {}",
+                bad_globs.join(", ")
+            )
+            .into());
+        }
         if !invalid_paths.is_empty() {
             return Err(anyhow!(
                 "The following files don't exist: {}",
@@ -108,17 +137,57 @@ impl AppConfig {
         rv
     }
 
-    pub fn get_public_keys(&self, path: &Path) -> Result<&[String]> {
-        let pubk = self
-            .config
-            .get(path.strip_prefix(&self.prefix).with_context(|| {
-                format!(
-                    "Not a path inside git repository, path={path:?}, repo={:?}",
-                    self.prefix
-                )
-            })?)
-            .with_context(|| format!("No public key can be found for '{}'", path.display()))?;
-        Ok(&pubk[..])
+    /// Resolve the set of recipients that should be used to encrypt the file
+    /// at `path`. Returns the union of recipients from every entry in
+    /// `git-agecrypt.toml` whose key either matches `path` literally or
+    /// matches it as a glob pattern. Order is stable across invocations: a
+    /// literal exact match (if present) is returned first, followed by the
+    /// globs in the order they appear in the on-disk file.
+    pub fn get_public_keys(&self, path: &Path) -> Result<Vec<String>> {
+        let rel = path.strip_prefix(&self.prefix).with_context(|| {
+            format!(
+                "Not a path inside git repository, path={path:?}, repo={:?}",
+                self.prefix
+            )
+        })?;
+
+        let mut collected: Vec<String> = Vec::new();
+        let push_dedup = |r: &String, out: &mut Vec<String>| {
+            if !out.contains(r) {
+                out.push(r.clone());
+            }
+        };
+
+        // 1. Exact literal match first, so the most-specific recipient set
+        //    shows up at the head of the list (and we don't even compile a
+        //    GlobMatcher when an exact entry exists).
+        if let Some(recipients) = self.config.get(rel) {
+            for r in recipients {
+                push_dedup(r, &mut collected);
+            }
+        }
+
+        // 2. Glob entries -- iterated in the file's serialized order so the
+        //    final recipient ordering is reproducible.
+        for (key, recipients) in &self.config {
+            let key_str = key.to_string_lossy();
+            if !is_glob(&key_str) {
+                continue;
+            }
+            let matcher = Glob::new(&key_str)
+                .with_context(|| format!("Invalid glob pattern in git-agecrypt.toml: {key_str}"))?
+                .compile_matcher();
+            if matcher.is_match(rel) {
+                for r in recipients {
+                    push_dedup(r, &mut collected);
+                }
+            }
+        }
+
+        if collected.is_empty() {
+            return Err(anyhow!("No public key can be found for '{}'", path.display()).into());
+        }
+        Ok(collected)
     }
 }
 
@@ -333,7 +402,7 @@ mod tests {
         app.add(vec![pk.clone()], vec![PathBuf::from("a")]).unwrap();
 
         let resolved = app.get_public_keys(&abs).unwrap();
-        assert_eq!(resolved, &[pk]);
+        assert_eq!(resolved, vec![pk]);
     }
 
     #[test]
@@ -351,5 +420,168 @@ mod tests {
         let app = AppConfig::load(&cfg, dir.path()).unwrap();
         let result = app.get_public_keys(&dir.path().join("never-added"));
         assert!(result.is_err());
+    }
+
+    // ----- glob path matching -----
+
+    #[test]
+    fn add_accepts_glob_pattern_without_existing_file() {
+        // A literal path is rejected if the file doesn't exist (regression guard),
+        // but a glob is by design a forward-looking pattern -- it must be
+        // registrable before any matching file exists.
+        let (dir, cfg) = fixture();
+        let pk = pubkey();
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.add(
+            vec![pk.clone()],
+            vec![PathBuf::from("**/terraform.tfstate")],
+        )
+        .unwrap();
+        assert_eq!(app.list().len(), 1);
+    }
+
+    #[test]
+    fn add_rejects_invalid_glob_pattern() {
+        let (dir, cfg) = fixture();
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        // Unclosed character class is invalid glob syntax.
+        let result = app.add(vec![pubkey()], vec![PathBuf::from("secrets/[unclosed")]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_public_keys_matches_double_star_glob_at_any_depth() {
+        // The whole point of this feature: `**/file` matches `file` at any
+        // depth without per-instance registration.
+        let (dir, cfg) = fixture();
+        let pk = pubkey();
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.add(
+            vec![pk.clone()],
+            vec![PathBuf::from("**/terraform.tfstate")],
+        )
+        .unwrap();
+
+        for depth in &[
+            "terraform.tfstate",
+            "a/terraform.tfstate",
+            "a/b/c/d/terraform.tfstate",
+        ] {
+            let resolved = app
+                .get_public_keys(&dir.path().join(depth))
+                .unwrap_or_else(|e| panic!("expected glob to match {depth}: {e}"));
+            assert_eq!(resolved, vec![pk.clone()], "depth {depth} should match");
+        }
+    }
+
+    #[test]
+    fn get_public_keys_glob_does_not_match_unrelated_files() {
+        let (dir, cfg) = fixture();
+        let pk = pubkey();
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.add(vec![pk], vec![PathBuf::from("**/terraform.tfstate")])
+            .unwrap();
+
+        let result = app.get_public_keys(&dir.path().join("a/b/other-file.txt"));
+        assert!(result.is_err(), "non-matching path must surface as no-key");
+    }
+
+    #[test]
+    fn get_public_keys_literal_and_glob_recipients_merge() {
+        // A file matched by both an exact entry and a glob entry must end up
+        // encrypted to the UNION of both recipient sets. This is what makes
+        // "default everyone via glob, plus targeted extras via literal" work.
+        let (dir, cfg) = fixture();
+        let pk_glob = pubkey();
+        let pk_literal = pubkey();
+        let placeholder = dir.path().join("dev/terraform.tfstate");
+        fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        fs::write(&placeholder, "").unwrap();
+
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.add(
+            vec![pk_glob.clone()],
+            vec![PathBuf::from("**/terraform.tfstate")],
+        )
+        .unwrap();
+        app.add(
+            vec![pk_literal.clone()],
+            vec![PathBuf::from("dev/terraform.tfstate")],
+        )
+        .unwrap();
+
+        let resolved = app.get_public_keys(&placeholder).unwrap();
+        assert_eq!(resolved.len(), 2);
+        // Literal exact match is collected first, glob entries come after.
+        assert_eq!(resolved[0], pk_literal);
+        assert!(resolved.contains(&pk_glob));
+    }
+
+    #[test]
+    fn get_public_keys_dedupes_when_same_recipient_matches_multiple_globs() {
+        // Two overlapping globs that share a recipient must not produce
+        // duplicate entries in the output (would cost an extra recipient slot
+        // in the age header and inflate the ciphertext for no reason).
+        let (dir, cfg) = fixture();
+        let pk = pubkey();
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.add(vec![pk.clone()], vec![PathBuf::from("**/*.tfstate")])
+            .unwrap();
+        app.add(
+            vec![pk.clone()],
+            vec![PathBuf::from("dev/**/terraform.tfstate")],
+        )
+        .unwrap();
+
+        let resolved = app
+            .get_public_keys(&dir.path().join("dev/foo/terraform.tfstate"))
+            .unwrap();
+        assert_eq!(resolved, vec![pk]);
+    }
+
+    #[test]
+    fn remove_with_glob_key_drops_entry() {
+        // Removal stays exact-string keyed: pass the same glob you registered
+        // and the entry disappears.
+        let (dir, cfg) = fixture();
+        let pk = pubkey();
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.add(
+            vec![pk.clone()],
+            vec![PathBuf::from("**/terraform.tfstate")],
+        )
+        .unwrap();
+        app.remove(vec![pk], vec![PathBuf::from("**/terraform.tfstate")])
+            .unwrap();
+        assert!(app.list().is_empty());
+    }
+
+    #[test]
+    fn save_load_round_trip_preserves_glob_keys_verbatim() {
+        // The on-disk TOML must keep the user's glob pattern as-is; we don't
+        // want to silently rewrite/expand it.
+        let (dir, cfg) = fixture();
+        let pk = pubkey();
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.add(
+            vec![pk.clone()],
+            vec![PathBuf::from("**/terraform.tfstate")],
+        )
+        .unwrap();
+        app.save().unwrap();
+
+        let reloaded = AppConfig::load(&cfg, dir.path()).unwrap();
+        let listed = reloaded.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "**/terraform.tfstate");
+        assert_eq!(listed[0].1, pk);
     }
 }

@@ -87,7 +87,7 @@ impl<C: Context> CommandContext<C> {
         let cfg = self.ctx.config()?;
         let public_keys = cfg.get_public_keys(&file)?;
 
-        let res = age::encrypt(public_keys, &mut &contents[..])?;
+        let res = age::encrypt(&public_keys, &mut &contents[..])?;
         self.ctx.store_sidecar(&file, "hash", hash.as_bytes())?;
         self.ctx.store_sidecar(&file, "age", &res)?;
         Ok(res)
