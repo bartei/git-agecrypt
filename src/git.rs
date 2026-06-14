@@ -159,7 +159,10 @@ impl Repository for LibGit2Repository {
         let mut entries = Vec::new();
 
         cfg.entries(Some(key))?.for_each(|e| {
-            if let Some(v) = e.value() {
+            // git2 0.21 changed `ConfigEntry::value()` from `Option<&str>` to
+            // `Result<&str, git2::Error>`; both report "value isn't valid
+            // UTF-8" as the non-`&str` case, which we skip either way.
+            if let Ok(v) = e.value() {
                 entries.push(v.into())
             }
         })?;

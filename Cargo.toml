@@ -20,7 +20,7 @@ anyhow = { version = "1.0.102", features = ["backtrace"] }
 blake3 = "1.8.5"
 clap = { version = "4.6.1", features = [ "derive" ] }
 env_logger = "0.11.10"
-git2 = { version = "0.20.0", default-features = false }
+git2 = { version = "0.21.0", default-features = false }
 globset = "0.4.16"
 log = "0.4.32"
 regex = "1.12.3"
