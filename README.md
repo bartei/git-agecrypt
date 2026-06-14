@@ -200,6 +200,13 @@ Recipients can be:
 - An OpenSSH `ssh-ed25519` or `ssh-rsa` line: typically `cat ~/.ssh/id_ed25519.pub`
 - An age plugin recipient: e.g. the `age1yubikey1…` line emitted by `age-plugin-yubikey`
 
+> **Note:** Native *tagged* recipients (`age1tag1…` / `age1tagpq1…`) — the
+> standardized format recent versions of `age-plugin-tpm` and `age-plugin-se`
+> emit for hardware-backed keys — are **not yet supported**. They require
+> `age::tag::Recipient`, which is unreleased in the upstream `age` crate;
+> git-agecrypt rejects them with a clear error until a release ships that type.
+> Tracking: [#17](https://github.com/bartei/git-agecrypt/issues/17).
+
 ```console
 # Encrypt one file to one recipient
 $ git-agecrypt config add \
