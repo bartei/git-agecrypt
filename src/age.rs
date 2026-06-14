@@ -87,7 +87,32 @@ fn load_public_keys(public_keys: &[impl AsRef<str>]) -> Result<Vec<Box<dyn Recip
         } else if let Ok(pk) = pubk.as_ref().parse::<age::ssh::Recipient>() {
             recipients.push(Box::new(pk));
         } else if let Ok(recipient) = pubk.as_ref().parse::<plugin::Recipient>() {
-            plugin_recipients.push(recipient);
+            // `age1tag1…` / `age1tagpq1…` are *native* tagged recipients
+            // (the standardized format emitted by recent age-plugin-tpm and
+            // age-plugin-se, for hardware-backed keys), not plugin recipients.
+            // age's plugin parser still accepts them because it reads the
+            // bech32 HRP (`age1tag` / `age1tagpq`) as a plugin name — so
+            // without this guard we'd go on to spawn a nonexistent
+            // `age-plugin-tag` binary and fail with a confusing error.
+            //
+            // Native support lives in `age::tag::Recipient` /
+            // `age::tagpq::Recipient`, which are unreleased upstream (the
+            // latest published `age` is 0.11.x, which lacks them). Once a
+            // release ships those types, parse the recipient natively here
+            // instead of bailing. Tracking:
+            // https://github.com/bartei/git-agecrypt/issues/17
+            match recipient.plugin() {
+                "tag" | "tagpq" => bail!(
+                    "Tagged recipients (`{}`) — the format produced by recent \
+                     age-plugin-tpm / age-plugin-se for hardware-backed keys — are not \
+                     yet supported by git-agecrypt. Native tagged-recipient support is \
+                     pending an upstream `age` crate release (the latest published \
+                     version lacks `age::tag::Recipient`). Track progress at \
+                     https://github.com/bartei/git-agecrypt/issues/17",
+                    pubk.as_ref()
+                ),
+                _ => plugin_recipients.push(recipient),
+            }
         } else {
             bail!("Invalid recipient");
         }
@@ -205,6 +230,32 @@ mod tests {
     fn validate_public_keys_rejects_garbage() {
         let result = validate_public_keys(&["this-is-not-a-recipient"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_public_keys_rejects_tagged_recipient_with_clear_message() {
+        // `age1tag1…` is a native tagged recipient (hardware-backed keys via
+        // age-plugin-tpm / age-plugin-se), which the published `age` crate
+        // can't yet encrypt to. age's plugin parser accepts it as plugin
+        // name "tag", so without our guard the tool would try to spawn a
+        // nonexistent `age-plugin-tag` binary. Assert we fail with an
+        // actionable message instead — and crucially do NOT mention a
+        // missing plugin binary. Recipient from age-plugin-tpm's docs.
+        let tag = "age1tag1q096edfp3ty6n36fj5kyq0yuesp7rdcmm7sjswzdcrekh6ash8n3uys987t";
+        let err = validate_public_keys(&[tag]).expect_err("tagged recipient must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Tagged recipients"),
+            "error should explain tagged recipients aren't supported: {msg}"
+        );
+        assert!(
+            msg.contains("bartei/git-agecrypt/issues/17"),
+            "error should point at the tracking issue: {msg}"
+        );
+        assert!(
+            !msg.contains("age-plugin-tag"),
+            "error must not blame a missing plugin binary: {msg}"
+        );
     }
 
     #[test]
