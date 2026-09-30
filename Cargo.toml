@@ -1,6 +1,6 @@
 [package]
 name = "git-agecrypt"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 # Edition 2024 needs Rust ≥ 1.85; transitive `rpassword` 7.5 (via age →
 # cli-common) uses let-chains, stable only from 1.88 — its own metadata
