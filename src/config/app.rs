@@ -93,6 +93,14 @@ impl AppConfig {
             )
             .into());
         }
+        // Recipients accumulate per path across calls, so check the merged
+        // set — before touching the config — not just this call's additions.
+        for path in &paths {
+            let mut merged = self.config.get(path).cloned().unwrap_or_default();
+            merged.extend(recipients.iter().cloned());
+            age::check_recipient_mix(&merged)
+                .with_context(|| format!("Invalid recipients for {}", path.display()))?;
+        }
         for path in paths {
             let entry = self.config.entry(path).or_default();
             for r in &recipients {
@@ -290,6 +298,30 @@ mod tests {
             vec![PathBuf::from("secrets/foo")],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn add_rejects_post_quantum_mixed_with_existing_classic() {
+        let (dir, cfg) = fixture();
+        let secret = dir.path().join("secrets/foo");
+        fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        fs::write(&secret, "").unwrap();
+
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        let pk = pubkey();
+        app.add(vec![pk.clone()], vec![PathBuf::from("secrets/foo")])
+            .unwrap();
+
+        // Each call is valid on its own; only the merged set is a mix.
+        let result = app.add(
+            vec![age::TEST_TAGPQ_RECIPIENT.to_string()],
+            vec![PathBuf::from("secrets/foo")],
+        );
+        assert!(result.is_err(), "PQ + classic on one path must be rejected");
+        let listed = app.list();
+        assert_eq!(listed.len(), 1, "rejected add must not modify config");
+        assert_eq!(listed[0].1, pk);
     }
 
     #[test]
