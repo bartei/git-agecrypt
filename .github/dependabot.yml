@@ -24,6 +24,11 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - ci
+    ignore:
+      # The action ref carries our MSRV pin (kept in lockstep with
+      # rust-toolchain.toml) and is bumped by hand. Dependabot also
+      # misreads the action's branch names as releases (e.g. "1.120").
+      - dependency-name: dtolnay/rust-toolchain
 
   - package-ecosystem: docker
     directory: /
