@@ -2,10 +2,11 @@
 name = "git-agecrypt"
 version = "0.5.0"
 edition = "2024"
-# Edition 2024 needs Rust ≥ 1.85; transitive ICU crates (pulled via age →
-# idna) need 1.86, so 1.86 is the effective MSRV. Declared explicitly so
-# cargo refuses to build on older toolchains.
-rust-version = "1.86"
+# Edition 2024 needs Rust ≥ 1.85; transitive `rpassword` 7.5 (via age →
+# cli-common) uses let-chains, stable only from 1.88 — its own metadata
+# under-declares this — so 1.88 is the effective MSRV. Declared explicitly
+# so cargo refuses to build on older toolchains.
+rust-version = "1.88"
 description = "Transparent file-level encryption for files in a git repository, powered by age."
 homepage = "https://bartei.github.io/git-agecrypt/"
 repository = "https://github.com/bartei/git-agecrypt"
@@ -15,7 +16,7 @@ readme = "README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-age = { version = "0.11.1", features = [ "cli-common", "armor", "ssh", "plugin" ] }
+age = { version = "0.11.5", features = [ "cli-common", "armor", "ssh", "plugin" ] }
 anyhow = { version = "1.0.102", features = ["backtrace"] }
 blake3 = "1.8.5"
 clap = { version = "4.6.1", features = [ "derive" ] }
