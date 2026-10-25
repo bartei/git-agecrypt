@@ -12,7 +12,7 @@
 
 Transparent file-level encryption for files in a git repository, powered by [age](https://age-encryption.org). The plaintext stays in your working tree; the ciphertext is what travels through `git add`, `git push`, and ends up in the remote.
 
-`git-agecrypt` is a modern, portable replacement for [git-crypt](https://github.com/AGWA/git-crypt): same workflow, but using age instead of GPG. Recipients can be age x25519 keys, OpenSSH ed25519 / RSA keys, or any [age plugin](https://github.com/FiloSottile/awesome-age) recipient (e.g. YubiKey PIV via `age-plugin-yubikey`).
+`git-agecrypt` is a modern, portable replacement for [git-crypt](https://github.com/AGWA/git-crypt): same workflow, but using age instead of GPG. Recipients can be age x25519 keys, OpenSSH ed25519 / RSA keys, native tagged recipients (`age1tag1…` / `age1tagpq1…`, e.g. TPM or Secure Enclave keys), or any [age plugin](https://github.com/FiloSottile/awesome-age) recipient (e.g. YubiKey PIV via `age-plugin-yubikey`).
 
 ## Features
 
@@ -199,13 +199,12 @@ Recipients can be:
 - An age native public key: `age1…`
 - An OpenSSH `ssh-ed25519` or `ssh-rsa` line: typically `cat ~/.ssh/id_ed25519.pub`
 - An age plugin recipient: e.g. the `age1yubikey1…` line emitted by `age-plugin-yubikey`
+- A native *tagged* recipient: `age1tag1…` or post-quantum `age1tagpq1…`, the standardized format emitted by recent `age-plugin-tpm` and `age-plugin-se` for hardware-backed keys (decrypt with the plugin's identity file as usual)
 
-> **Note:** Native *tagged* recipients (`age1tag1…` / `age1tagpq1…`) — the
-> standardized format recent versions of `age-plugin-tpm` and `age-plugin-se`
-> emit for hardware-backed keys — are **not yet supported**. They require
-> `age::tag::Recipient`, which is unreleased in the upstream `age` crate;
-> git-agecrypt rejects them with a clear error until a release ships that type.
-> Tracking: [#17](https://github.com/bartei/git-agecrypt/issues/17).
+> **Note:** Post-quantum recipients (`age1tagpq1…`) can't share a file with
+> classic ones (x25519, SSH or `age1tag1…`): age refuses to encrypt to both, as
+> the classic recipient would void the post-quantum protection. `config add`
+> rejects such a mix up front.
 
 ```console
 # Encrypt one file to one recipient

@@ -18,10 +18,10 @@
 - [x] Ignore `dtolnay/rust-toolchain` in `dependabot.yml`
 
 ## Phase 5 — Land and triage PRs
-- [ ] Open PR for `fix/security-deps`, CI green
-- [ ] Merge PR
-- [ ] Close #32 and #37 as superseded
-- [ ] Close #36 as bogus
+- [x] Open PR for `fix/security-deps`, CI green
+- [x] Merge PR
+- [x] Close #32 and #37 as superseded
+- [x] Close #36 as bogus
 - [ ] Rebase and merge #35
 - [ ] Scheduled `Audit` on main is green
 

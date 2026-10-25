@@ -78,6 +78,7 @@ pub(crate) fn encrypt(
 }
 
 fn load_public_keys(public_keys: &[impl AsRef<str>]) -> Result<Vec<Box<dyn Recipient + Send>>> {
+    check_recipient_mix(public_keys)?;
     let mut recipients: Vec<Box<dyn Recipient + Send>> = vec![];
     let mut plugin_recipients = vec![];
 
@@ -86,33 +87,17 @@ fn load_public_keys(public_keys: &[impl AsRef<str>]) -> Result<Vec<Box<dyn Recip
             recipients.push(Box::new(pk));
         } else if let Ok(pk) = pubk.as_ref().parse::<age::ssh::Recipient>() {
             recipients.push(Box::new(pk));
+        } else if let Ok(pk) = pubk.as_ref().parse::<age::tag::Recipient>() {
+            // Native tagged recipients (`age1tag1…`), the standardized format
+            // emitted by age-plugin-tpm / age-plugin-se for hardware-backed
+            // keys. Must be tried before the plugin parser, which would
+            // otherwise read the `age1tag` HRP as a plugin named "tag".
+            recipients.push(Box::new(pk));
+        } else if let Ok(pk) = pubk.as_ref().parse::<age::tagpq::Recipient>() {
+            // Post-quantum variant (`age1tagpq1…`), same plugin-HRP caveat.
+            recipients.push(Box::new(pk));
         } else if let Ok(recipient) = pubk.as_ref().parse::<plugin::Recipient>() {
-            // `age1tag1…` / `age1tagpq1…` are *native* tagged recipients
-            // (the standardized format emitted by recent age-plugin-tpm and
-            // age-plugin-se, for hardware-backed keys), not plugin recipients.
-            // age's plugin parser still accepts them because it reads the
-            // bech32 HRP (`age1tag` / `age1tagpq`) as a plugin name — so
-            // without this guard we'd go on to spawn a nonexistent
-            // `age-plugin-tag` binary and fail with a confusing error.
-            //
-            // Native support lives in `age::tag::Recipient` /
-            // `age::tagpq::Recipient`, which are unreleased upstream (the
-            // latest published `age` is 0.11.x, which lacks them). Once a
-            // release ships those types, parse the recipient natively here
-            // instead of bailing. Tracking:
-            // https://github.com/bartei/git-agecrypt/issues/17
-            match recipient.plugin() {
-                "tag" | "tagpq" => bail!(
-                    "Tagged recipients (`{}`) — the format produced by recent \
-                     age-plugin-tpm / age-plugin-se for hardware-backed keys — are not \
-                     yet supported by git-agecrypt. Native tagged-recipient support is \
-                     pending an upstream `age` crate release (the latest published \
-                     version lacks `age::tag::Recipient`). Track progress at \
-                     https://github.com/bartei/git-agecrypt/issues/17",
-                    pubk.as_ref()
-                ),
-                _ => plugin_recipients.push(recipient),
-            }
+            plugin_recipients.push(recipient);
         } else {
             bail!("Invalid recipient");
         }
@@ -125,6 +110,37 @@ fn load_public_keys(public_keys: &[impl AsRef<str>]) -> Result<Vec<Box<dyn Recip
     }
 
     Ok(recipients)
+}
+
+/// Rejects a recipient set that mixes post-quantum (`age1tagpq1…`) and classic
+/// (x25519, SSH, `age1tag1…`) recipients. age refuses to encrypt to such a set
+/// — a classic recipient would void the post-quantum protection — but only
+/// fails at encryption time (i.e. during `git add`); checking here lets
+/// `config add` fail up front. Plugin recipients only declare their labels
+/// when encrypting, so they're skipped and left to age's own check.
+pub(crate) fn check_recipient_mix(public_keys: &[impl AsRef<str>]) -> Result<()> {
+    let (mut pq, mut classic) = (false, false);
+    for pubk in public_keys {
+        let pubk = pubk.as_ref();
+        if pubk.parse::<age::tagpq::Recipient>().is_ok() {
+            pq = true;
+        } else if pubk.parse::<age::x25519::Recipient>().is_ok()
+            || pubk.parse::<age::ssh::Recipient>().is_ok()
+            || pubk.parse::<age::tag::Recipient>().is_ok()
+        {
+            classic = true;
+        }
+    }
+    if pq && classic {
+        bail!(
+            "Post-quantum recipients (`age1tagpq1…`) can't be combined with classic \
+             recipients (x25519, SSH or `age1tag1…`) for the same file: age refuses to \
+             encrypt to both, as the classic recipient would void the post-quantum \
+             protection. Use only post-quantum recipients for this file, or drop the \
+             `age1tagpq1…` one."
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_public_keys(public_keys: &[impl AsRef<str>]) -> Result<()> {
@@ -142,6 +158,10 @@ pub(crate) fn validate_identity(identity: impl AsRef<Path>) -> Result<()> {
     read_identities(vec![id_str], None, &mut stdin_guard)?;
     Ok(())
 }
+
+/// `age1tagpq1…` recipient from the `age` crate's own test vectors.
+#[cfg(test)]
+pub(crate) const TEST_TAGPQ_RECIPIENT: &str = "age1tagpq1m3e4wvp6hzcrn9exhy0ae3xfx2sjymp594k3tg7j4dpmj922we65vtnmrt2pyallax8669zqkr2pmfchptr4n38kug2xmcmp3adk2lnjqu00x5kxz5pvhmrltvfh9wuq973pcx35cnq8syn9qd3tzpehgztl4xpzr3tpd67g8af9trnjpc05gh7wu536aq4qt2y8zhsm4tvrfpsfl36qs5fpzysnk3sp9w77qzeg49357xex40v4s2lvt620swyys7u8yxdcnu4rkkwxdmt55gsuc3h5c5swahnegjgqwc60hn085ec3sjztwm45l44y3j2at9t6v9zra4ek3kek6waecqm98yaxl37w0d2zra626nz63jdm5sg59w7lyptw83zm6fntd8d0x03a9z6h9prfgpygzar6zrxjcrt4cdctk2mhf95s4a6v4zklfd49xhpsaeujm57thx2x3e3hwzc86ftfhmq5mkxxz3d6r8ws24xj4qfn73eyezg2wy094e3why592pghz27ruq3vkyegrv80eftnw9wqzwgvnwyseaus0yt84fylzrpzp6x2fguxuqjmgudr8xd33qm30evdpxd3jvjg8qh4q60kyq80jgff369k7nrepdc38grd2dava520excqp0ey0x39khx8ry03yffcatgv84fsx5j49djpapedsy693zute5xv5g2ewzrlj5se7akvkc4g4vmzhputpq8eyj9wz5dz6qtn7g3cfpd95nahw4ytspan0feyye04dcylv24ege7zkaj004gjwcxqxfqu2quawa83sx452jqjn8t48czp0xspwgnmvjyhttzzy6nhq8xzkdwnvsfefkwva6asrqc93zjn4rly5gnlv93xy3uzmr39szvjnf63426qzyeyvguc4vdcquwgsxgq236afcpqz866ny4tn7ckc0umefj242rt5vtvwqzzrvfev2mpvqcufp9pqvefyv4ftyuhgausfzuaadsczeykmft5wv3frzgrcp9ztr93h478ke4t86spp2uhyjkj73mp9g92ddk2fpv7v3njzsqgwhq3789sqrgkskehn0zjscckhwftyq4vet7vrlx2hs5kd9cwnq6t0djffhh3zquh4j3p0yaj9z2rc9wykg0usqw7983rrgur9jg8rnnqypwcz2lyclnnc705fc5g3an93ps60q6mxqp85u0ewtxdjlqcks84yduft0a0g6e7naew3v9u2d08knarvajn8q3gq9pgxde3s7nx94lus48wwvw2xjm7k82tvylec2393jdsuvch2xpe77w8hpv9nvsxfsrs270njpmfvpmgyk2cffl9tjp3qqcc4dfkf5rme2dg0x7ew8g39www5smm705q5da4eqvnqwrkavtq6xje9ss38hnkglz4eddz8f5qruvqmq2ff9l22gwkv8h432rdkysy0grkul8e2fedvkyyapfxt760udcgu92m54wl9yavmj4ga3ph9r5n99cjrq6wj5v33x33fe5vkjvfwnnt40wuv2hyexc9f4ylyqv9ldqq9epd4yuv8vrsfx2qy2kqz08kqhnzspy6s0x8fa5c2xkg5y2q0rvz4vnk7rp0acg6eksc3t7cxnn8y7glkjsqja3p56uz6vvhcw55d3ysad0hvsqxpjnc7svenf2gc5xn5kyr0et2vvyruxlnpqcdpqh9pzplumy5yzjxftyzh9ujfw0jq7ee60zx2x23p0jzyh9dvmly8p9h9ysptlqu7kwnejd65dnr75a0np2fvke8xen38r57w6z3wz3mycjmmn267wwxndfh9jdps7uxtct2wwfgamkpa5ap8s96lhfjztpwcm6fguhphu38yunu2v4vz3syzrvgwtqpemkewzp766nyu6texxvjlaemnhyyqutkcy6a42vqfsz49rw5wr4gt70r4vdaasehqjg46fnyts4sthrxadfllha3avu49wsj2c4jx";
 
 #[cfg(test)]
 mod tests {
@@ -233,29 +253,50 @@ mod tests {
     }
 
     #[test]
-    fn validate_public_keys_rejects_tagged_recipient_with_clear_message() {
+    fn encrypt_to_tagged_recipient() {
         // `age1tag1…` is a native tagged recipient (hardware-backed keys via
-        // age-plugin-tpm / age-plugin-se), which the published `age` crate
-        // can't yet encrypt to. age's plugin parser accepts it as plugin
-        // name "tag", so without our guard the tool would try to spawn a
-        // nonexistent `age-plugin-tag` binary. Assert we fail with an
-        // actionable message instead — and crucially do NOT mention a
-        // missing plugin binary. Recipient from age-plugin-tpm's docs.
+        // age-plugin-tpm / age-plugin-se). age's plugin parser would read it
+        // as plugin "tag" and try to spawn a nonexistent `age-plugin-tag`,
+        // so assert it is encrypted to natively. Recipient from
+        // age-plugin-tpm's docs.
         let tag = "age1tag1q096edfp3ty6n36fj5kyq0yuesp7rdcmm7sjswzdcrekh6ash8n3uys987t";
-        let err = validate_public_keys(&[tag]).expect_err("tagged recipient must be rejected");
+        validate_public_keys(&[tag]).unwrap();
+        let ciphertext = encrypt(&[tag], &mut &b"secret"[..]).unwrap();
+        let header = String::from_utf8_lossy(&ciphertext);
+        assert!(
+            header.contains("-> p256tag "),
+            "expected a p256tag stanza in the header: {header}"
+        );
+    }
+
+    #[test]
+    fn encrypt_to_tagpq_recipient() {
+        validate_public_keys(&[TEST_TAGPQ_RECIPIENT]).unwrap();
+        let ciphertext = encrypt(&[TEST_TAGPQ_RECIPIENT], &mut &b"secret"[..]).unwrap();
+        let header = String::from_utf8_lossy(&ciphertext);
+        assert!(
+            header.contains("-> mlkem768p256tag "),
+            "expected a mlkem768p256tag stanza in the header: {header}"
+        );
+    }
+
+    #[test]
+    fn rejects_post_quantum_mixed_with_classic() {
+        let (_id, public, _) = keypair();
+        let err = validate_public_keys(&[TEST_TAGPQ_RECIPIENT, public.as_str()])
+            .expect_err("PQ + classic must be rejected");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("Tagged recipients"),
-            "error should explain tagged recipients aren't supported: {msg}"
+            msg.contains("can't be combined with classic"),
+            "error should explain the PQ/classic mix: {msg}"
         );
-        assert!(
-            msg.contains("bartei/git-agecrypt/issues/17"),
-            "error should point at the tracking issue: {msg}"
-        );
-        assert!(
-            !msg.contains("age-plugin-tag"),
-            "error must not blame a missing plugin binary: {msg}"
-        );
+    }
+
+    #[test]
+    fn accepts_classic_mix_of_x25519_and_tag() {
+        let (_id, public, _) = keypair();
+        let tag = "age1tag1q096edfp3ty6n36fj5kyq0yuesp7rdcmm7sjswzdcrekh6ash8n3uys987t";
+        encrypt(&[public.as_str(), tag], &mut &b"secret"[..]).unwrap();
     }
 
     #[test]
