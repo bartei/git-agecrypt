@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::ctx::Context;
 
-use super::{internal, public};
+use super::{internal, process, public};
 
 use super::args::{Args, Commands, InternalCommands, ModifyConfig, PublicCommands, QueryConfig};
 
@@ -19,6 +19,7 @@ fn run_internal_command(commands: InternalCommands, ctx: impl Context) -> Result
         InternalCommands::Clean { file } => cmd.clean(file),
         InternalCommands::Smudge { file } => cmd.smudge(file),
         InternalCommands::Textconv { path } => cmd.textconv(path),
+        InternalCommands::Process => process::serve(&cmd),
     }
 }
 

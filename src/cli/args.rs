@@ -13,7 +13,7 @@ pub struct Args {
 #[derive(Subcommand)]
 #[clap(
     after_help = "In addition to the above, The following subcommands are used from git filters:
-    clean, smudge, textconv"
+    clean, smudge, textconv, process"
 )]
 pub enum Commands {
     #[command(flatten)]
@@ -205,6 +205,11 @@ pub enum InternalCommands {
         /// File to show
         path: PathBuf,
     },
+
+    /// Serve clean and smudge for a whole git command (filter.<driver>.process).
+    /// Locked unless this worktree has a pinned policy from `on`.
+    #[command(hide = true)]
+    Process,
 }
 
 pub fn parse_args() -> Args {

@@ -987,3 +987,32 @@ fn rekey_moves_unchanged_files_to_new_recipients() {
     assert!(fx.run_ok(&["rekey"]).contains("Re-encrypted secrets/s.txt"));
     assert!(opens_with(&staged_bytes(&fx, "secrets/s.txt"), &other));
 }
+
+#[test]
+fn process_filter_round_trips() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    // Same normalisation as `init`: git's config parser eats backslashes.
+    let exe = agecrypt_bin().to_str().unwrap().replace('\\', "/");
+    fx.git(&["config", "--unset", "filter.git-agecrypt.clean"]);
+    fx.git(&["config", "--unset", "filter.git-agecrypt.smudge"]);
+    fx.git(&[
+        "config",
+        "filter.git-agecrypt.process",
+        &format!("\"{exe}\" process"),
+    ]);
+    fx.write("secrets/secret.txt", "through the process filter");
+    fx.add_recipient_for("secret.txt");
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/secret.txt",
+    ]);
+    fx.git(&["commit", "-m", "secret"]);
+    assert!(staged_bytes(&fx, "secrets/secret.txt").starts_with(b"age-encryption.org/v1"));
+    fs::remove_file(fx.workdir().join("secrets/secret.txt")).unwrap();
+    fx.git(&["checkout", "--", "secrets/secret.txt"]);
+    assert_eq!(fx.read("secrets/secret.txt"), "through the process filter");
+}
