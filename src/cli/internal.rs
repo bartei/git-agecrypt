@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::{
+    cell::OnceCell,
     fs,
     io::{self, Read, Write},
     path::Path,
+    process::{Command, Stdio},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 
 use crate::{
     age,
@@ -21,15 +23,33 @@ type Identities = Vec<Box<dyn ::age::Identity>>;
 
 pub(crate) struct CommandContext<C: Context> {
     pub ctx: C,
+    /// Loaded once per process, so a long-running filter reads the secret
+    /// store once. A failure is kept too: a cancelled secret-store prompt must
+    /// not come back once per file.
+    identities: OnceCell<std::result::Result<Identities, String>>,
 }
 
 impl<C: Context> CommandContext<C> {
     pub(crate) fn new(ctx: C) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            identities: OnceCell::new(),
+        }
     }
 
-    fn identities(&self) -> Result<Identities> {
-        age::load_identities(&self.get_identities()?)
+    fn identities(&self) -> Result<&Identities> {
+        self.identities
+            .get_or_init(|| self.load_identities().map_err(|e| format!("{e:#}")))
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn load_identities(&self) -> Result<Identities> {
+        let mut ids = age::load_identities(&self.get_identities()?)?;
+        for command in self.ctx.identity_commands()? {
+            ids.extend(age::identities_from_text(&run_identity_command(&command)?)?);
+        }
+        Ok(ids)
     }
 
     pub(crate) fn clean(&self, file: impl AsRef<Path>) -> Result<()> {
@@ -96,7 +116,7 @@ impl<C: Context> CommandContext<C> {
             }
             Err(e) => return Err(e.into()),
         };
-        let decrypted = age::decrypt_with(&self.identities()?, &head)?.unwrap_or_default();
+        let decrypted = age::decrypt_with(self.identities()?, &head)?.unwrap_or_default();
         Ok((decrypted == contents).then_some(head))
     }
 
@@ -128,7 +148,7 @@ impl<C: Context> CommandContext<C> {
         log::info!("Decrypting file");
         let file = self.ctx.repo().workdir().join(file);
 
-        let Some(rv) = age::decrypt_with(&self.identities()?, &encrypted)? else {
+        let Some(rv) = age::decrypt_with(self.identities()?, &encrypted)? else {
             bail!("Input isn't encrypted")
         };
         log::info!("Decrypted file");
@@ -144,10 +164,13 @@ impl<C: Context> CommandContext<C> {
         Ok(rv)
     }
 
+    /// One process per blob (git has no textconv process mode), so the
+    /// identityCommand runs per blob here. Never set diff.*.cachetextconv: its
+    /// notes would store plaintext in shared refs.
     pub(crate) fn textconv(&self, path: impl AsRef<Path>) -> Result<()> {
         log::info!("Decrypting file to show in diff");
         let data = fs::read(path)?;
-        let result = match age::decrypt_with(&self.identities()?, &data)? {
+        let result = match age::decrypt_with(self.identities()?, &data)? {
             Some(rv) => rv,
             None => {
                 log::info!("File isn't encrypted, probably a working copy; showing as is.");
@@ -156,6 +179,23 @@ impl<C: Context> CommandContext<C> {
         };
         Ok(io::stdout().write_all(&result)?)
     }
+}
+
+/// Run an `identityCommand` and return what it printed. stderr stays attached
+/// so a secret store can still talk to the user (unlock prompts).
+fn run_identity_command(command: &str) -> Result<String> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .with_context(|| format!("cannot run identityCommand {command:?}"))?;
+    if !out.status.success() {
+        bail!("identityCommand {command:?} failed ({})", out.status);
+    }
+    String::from_utf8(out.stdout).context("identityCommand output is not UTF-8")
 }
 
 #[cfg(test)]
@@ -271,6 +311,10 @@ mod tests {
             Box::new(StaticIdentities {
                 paths: self.identities.clone(),
             })
+        }
+
+        fn identity_commands(&self) -> Result<Vec<String>> {
+            Ok(vec![])
         }
 
         fn config(&self) -> Result<AppConfig> {

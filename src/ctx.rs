@@ -30,6 +30,10 @@ pub(crate) trait Context {
 
     fn age_identities(&self) -> Box<dyn Container<Item = AgeIdentity> + '_>;
 
+    /// `git-agecrypt.config.identityCommand` values: commands that print an
+    /// age identity file (e.g. a secret manager read), run once per process.
+    fn identity_commands(&self) -> Result<Vec<String>>;
+
     fn config(&self) -> Result<AppConfig>;
 }
 
@@ -154,6 +158,13 @@ impl<R: git::Repository> Context for ContextWrapper<R> {
     fn age_identities(&self) -> Box<dyn Container<Item = AgeIdentity> + '_> {
         let cfg = GitConfig::new(self, "identity".into());
         Box::new(AgeIdentities::new(cfg))
+    }
+
+    fn identity_commands(&self) -> Result<Vec<String>> {
+        // libgit2 matches the lowercased key name.
+        Ok(self
+            .repo
+            .list_config(r"^git-agecrypt\.config\.identitycommand$")?)
     }
 
     fn config(&self) -> Result<AppConfig> {

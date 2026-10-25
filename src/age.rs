@@ -4,7 +4,7 @@ use std::{
 };
 
 use age::{
-    DecryptError, Decryptor, Encryptor, Identity, Recipient,
+    DecryptError, Decryptor, Encryptor, Identity, IdentityFile, NoCallbacks, Recipient,
     armor::ArmoredReader,
     cli_common::{StdinGuard, UiCallbacks, read_identities},
     plugin::{self, RecipientPluginV1},
@@ -65,6 +65,19 @@ pub(crate) fn decrypt_with(
         Some(e) => anyhow::anyhow!(e).context("no identity could decrypt; one of them failed"),
         None => anyhow::anyhow!(DecryptError::NoMatchingKeys),
     })
+}
+
+/// Identities from the text an `identityCommand` printed (an identity file).
+pub(crate) fn identities_from_text(text: &str) -> Result<Vec<Box<dyn Identity>>> {
+    let ids = IdentityFile::from_buffer(io::Cursor::new(text.as_bytes()))
+        .context("identityCommand output is not an age identity file")?
+        .with_callbacks(NoCallbacks)
+        .into_identities()
+        .context("identityCommand output holds no usable identity")?;
+    if ids.is_empty() {
+        bail!("identityCommand printed no identity");
+    }
+    Ok(ids)
 }
 
 pub(crate) fn load_identities(identities: &[impl AsRef<Path>]) -> Result<Vec<Box<dyn Identity>>> {
@@ -368,5 +381,19 @@ mod tests {
             msg.contains("not valid UTF-8"),
             "error must mention UTF-8: {msg}"
         );
+    }
+
+    #[test]
+    fn identities_from_text_reads_an_identity_file() {
+        let (_id, public, secret) = keypair();
+        let ids = identities_from_text(&format!("# created: now\n{secret}\n")).unwrap();
+        let ciphertext = encrypt(&[public], &mut &b"secret"[..]).unwrap();
+        assert_eq!(decrypt_with(&ids, &ciphertext).unwrap().unwrap(), b"secret");
+    }
+
+    #[test]
+    fn identities_from_text_refuses_output_without_identity() {
+        assert!(identities_from_text("").is_err());
+        assert!(identities_from_text("# only a comment\n").is_err());
     }
 }

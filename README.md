@@ -469,7 +469,7 @@ When `clean` sees the same plaintext for the same recipients, it emits the cache
 | `git-agecrypt.toml` (repo root) | path → recipient mappings | **Yes** — committed and shared |
 | `.gitattributes` | which paths use the filter | **Yes** — committed and shared |
 | `.git/config` (filter wiring) | absolute path to the binary | No |
-| `.git/config` (`[git-agecrypt "config"] identity`) | paths to *your* private keys | No |
+| `.git/config` (`[git-agecrypt "config"] identity`, `identityCommand`) | paths to *your* private keys, or commands that print them | No |
 | `.git/git-agecrypt/v2/*` (per worktree) | per-file ciphertext, plaintext hash, recipients | No |
 
 Encryption never needs the private key, so `git-agecrypt config add -r` works on a fresh clone before any identity is configured. Decryption of course does — that's what `config add -i` is for.
