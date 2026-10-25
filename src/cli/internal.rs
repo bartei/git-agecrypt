@@ -1,96 +1,97 @@
+// SPDX-FileCopyrightText: 2021 László Vaskó <opensource@vlaci.email>
+// SPDX-License-Identifier: MPL-2.0
+
 use std::{
     fs::File,
     io::{self, Read, Seek, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use anyhow::{Result, bail};
-use blake3::Hash;
 
-use crate::{age, ctx::Context, git::Error as GitError, git::Repository};
+use crate::{
+    age,
+    cache::{self, CacheEntry},
+    ctx::Context,
+    git::Error as GitError,
+    git::Repository,
+};
 
 pub(crate) struct CommandContext<C: Context> {
     pub ctx: C,
 }
 
 impl<C: Context> CommandContext<C> {
+    pub(crate) fn new(ctx: C) -> Self {
+        Self { ctx }
+    }
+
     pub(crate) fn clean(&self, file: impl AsRef<Path>) -> Result<()> {
-        log::info!("Encrypting file");
-        let file = self.ctx.repo().workdir().join(file);
-
-        log::debug!("Looking for saved hash information. target={file:?}",);
-        let mut existing_hash = [0u8; 32];
-        if let Some(hash_buffer) = self.ctx.load_sidecar(&file, "hash")? {
-            existing_hash = hash_buffer.as_slice().try_into()?
-        } else {
-            log::debug!("No saved hash file found");
-        }
-
-        let mut hasher = blake3::Hasher::new();
         let mut contents = vec![];
         io::stdin().read_to_end(&mut contents)?;
-        let hash = hasher.update(&contents).finalize();
-
-        let old_hash = Hash::from(existing_hash);
-        log::debug!(
-            "Comparing hashes for file; old_hash={}, new_hash={:?}",
-            old_hash.to_hex().as_str(),
-            hash.to_hex().as_str()
-        );
-
-        let saved = if hash == old_hash {
-            self.ctx.load_sidecar(&file, "age")?
-        } else {
-            None
-        };
-
-        let result = self.get_content(contents, hash, file, saved)?;
+        let result = self.clean_bytes(file.as_ref(), contents)?;
         Ok(io::stdout().write_all(&result)?)
     }
 
-    fn get_content(
-        &self,
-        contents: Vec<u8>,
-        hash: Hash,
-        file: PathBuf,
-        saved_content: Option<Vec<u8>>,
-    ) -> Result<Vec<u8>> {
-        if let Some(saved_content) = saved_content {
-            log::debug!("File didn't change since last encryption, loading from git HEAD");
-            return Ok(saved_content);
-        }
+    /// Encrypt for the index. Reuses the cached or HEAD ciphertext only while
+    /// both the plaintext and the recipients are unchanged (vlaci/git-agecrypt
+    /// 0.6 logic), so a recipient change re-encrypts instead of silently
+    /// keeping the old recipients.
+    pub(crate) fn clean_bytes(&self, file: &Path, contents: Vec<u8>) -> Result<Vec<u8>> {
+        log::info!("Encrypting file");
+        let workdir = self.ctx.repo().workdir().to_path_buf();
+        let file = workdir.join(file);
+        let hash = *blake3::hash(&contents).as_bytes();
+        let recipients = self.ctx.config()?.get_public_keys(&file)?;
+        let fp = cache::recipients_fingerprint(&recipients);
+        let known =
+            |e: &CacheEntry| e.recipients == fp || e.recipients == cache::UNKNOWN_RECIPIENTS;
+        let entry = self.ctx.load_cache(&file)?;
 
-        log::debug!("Encrypted content changed, checking decrypted version");
-        let repo_contents = match self.ctx.repo().get_file_contents(&file) {
-            Ok(v) => Some(v),
+        if let Some(e) = &entry
+            && e.plaintext_hash == hash
+            && known(e)
+        {
+            if e.recipients == cache::UNKNOWN_RECIPIENTS {
+                self.store(&file, hash, fp, e.ciphertext.clone())?;
+            }
+            return Ok(e.ciphertext.clone());
+        }
+        if entry.as_ref().is_none_or(known)
+            && let Some(head) = self.head_ciphertext_for(&file, &contents)?
+        {
+            self.store(&file, hash, fp, head.clone())?;
+            return Ok(head);
+        }
+        log::debug!("File or recipients changed since last encryption, re-encrypting");
+        let res = age::encrypt(&recipients, &mut &contents[..])?;
+        self.store(&file, hash, fp, res.clone())?;
+        Ok(res)
+    }
+
+    fn store(&self, file: &Path, hash: [u8; 32], fp: [u8; 32], ciphertext: Vec<u8>) -> Result<()> {
+        self.ctx.store_cache(
+            file,
+            &CacheEntry {
+                plaintext_hash: hash,
+                recipients: fp,
+                ciphertext,
+            },
+        )
+    }
+
+    /// HEAD's ciphertext when it decrypts to `contents`, so the index does not churn.
+    fn head_ciphertext_for(&self, file: &Path, contents: &[u8]) -> Result<Option<Vec<u8>>> {
+        let head = match self.ctx.repo().get_file_contents(file) {
+            Ok(v) => v,
             Err(GitError::NotExist(s)) => {
                 log::debug!("{s}");
-                None
+                return Ok(None);
             }
             Err(e) => return Err(e.into()),
         };
-
-        if let Some(repo_contents) = repo_contents {
-            let identities = self.get_identities()?;
-            let mut cur = io::Cursor::new(repo_contents);
-            let decrypted = age::decrypt(&identities, &mut cur)?.unwrap_or_default();
-            if decrypted == contents {
-                log::debug!("Decrypted content matches, using from working copy");
-                self.ctx.store_sidecar(&file, "hash", hash.as_bytes())?;
-                self.ctx.store_sidecar(&file, "age", cur.get_ref())?;
-                return Ok(cur.into_inner());
-            }
-        }
-
-        log::debug!("File changed since last encryption, re-encrypting");
-
-        let cfg = self.ctx.config()?;
-        let public_keys = cfg.get_public_keys(&file)?;
-
-        let res = age::encrypt(&public_keys, &mut &contents[..])?;
-        self.ctx.store_sidecar(&file, "hash", hash.as_bytes())?;
-        self.ctx.store_sidecar(&file, "age", &res)?;
-        Ok(res)
+        let decrypted = age::decrypt(&self.get_identities()?, &mut &head[..])?.unwrap_or_default();
+        Ok((decrypted == contents).then_some(head))
     }
 
     fn get_identities(&self) -> Result<Vec<String>> {
@@ -111,35 +112,30 @@ impl<C: Context> CommandContext<C> {
     }
 
     pub(crate) fn smudge(&self, file: impl AsRef<Path>) -> Result<()> {
+        let mut encrypted = vec![];
+        io::stdin().read_to_end(&mut encrypted)?;
+        let result = self.smudge_bytes(file.as_ref(), encrypted)?;
+        Ok(io::stdout().write_all(&result)?)
+    }
+
+    pub(crate) fn smudge_bytes(&self, file: &Path, encrypted: Vec<u8>) -> Result<Vec<u8>> {
         log::info!("Decrypting file");
         let file = self.ctx.repo().workdir().join(file);
 
-        let mut encrypted = vec![];
-        io::stdin().read_to_end(&mut encrypted)?;
-        if age::crlf_rewritten(&encrypted) {
-            bail!(
-                "{} looks like an age file whose line endings were rewritten (CRLF), so it \
-                 cannot be decrypted: git treated the ciphertext as text. Add `-text` to the \
-                 path's .gitattributes entry (e.g. `secrets/* filter=git-agecrypt \
-                 diff=git-agecrypt -text`) and check the file out again.",
-                file.display()
-            );
-        }
-        let mut cur = io::Cursor::new(encrypted);
-        let all_identities = self.get_identities()?;
-        if let Some(rv) = age::decrypt(&all_identities, &mut cur)? {
-            log::info!("Decrypted file");
-            let mut hasher = blake3::Hasher::new();
-            let hash = hasher.update(&rv).finalize();
-
-            log::debug!("Storing hash for file; hash={:?}", hash.to_hex().as_str(),);
-            self.ctx.store_sidecar(&file, "hash", hash.as_bytes())?;
-            self.ctx.store_sidecar(&file, "age", cur.get_ref())?;
-
-            Ok(io::stdout().write_all(&rv)?)
-        } else {
+        let Some(rv) = age::decrypt(&self.get_identities()?, &mut &encrypted[..])? else {
             bail!("Input isn't encrypted")
-        }
+        };
+        log::info!("Decrypted file");
+        // Unknown when the toml has no entry for this path: clean upgrades it.
+        let fp = self
+            .ctx
+            .config()
+            .ok()
+            .and_then(|c| c.get_public_keys(&file).ok())
+            .map(|keys| cache::recipients_fingerprint(&keys))
+            .unwrap_or(cache::UNKNOWN_RECIPIENTS);
+        self.store(&file, *blake3::hash(&rv).as_bytes(), fp, encrypted)?;
+        Ok(rv)
     }
 
     pub(crate) fn textconv(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -177,10 +173,11 @@ mod tests {
     use ::age::secrecy::ExposeSecret;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     /// In-memory `Repository` whose only meaningful behaviour is exposing
     /// a configurable HEAD blob for a path. The other methods are not
-    /// reached by `get_content` so they panic if called — this catches
+    /// reached by `clean_bytes` so they panic if called — this catches
     /// regressions where the production code starts depending on them.
     struct TestRepo {
         workdir: PathBuf,
@@ -247,7 +244,7 @@ mod tests {
 
     struct TestContext {
         repo: TestRepo,
-        sidecars: RefCell<HashMap<(PathBuf, String), Vec<u8>>>,
+        cache: RefCell<HashMap<PathBuf, CacheEntry>>,
         identities: Vec<String>,
         config_path: PathBuf,
     }
@@ -258,19 +255,15 @@ mod tests {
             &self.repo
         }
 
-        fn store_sidecar(&self, path: &Path, ext: &str, content: &[u8]) -> Result<()> {
-            self.sidecars
+        fn store_cache(&self, path: &Path, entry: &CacheEntry) -> Result<()> {
+            self.cache
                 .borrow_mut()
-                .insert((path.to_path_buf(), ext.to_string()), content.to_vec());
+                .insert(path.to_path_buf(), entry.clone());
             Ok(())
         }
 
-        fn load_sidecar(&self, path: &Path, ext: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self
-                .sidecars
-                .borrow()
-                .get(&(path.to_path_buf(), ext.to_string()))
-                .cloned())
+        fn load_cache(&self, path: &Path) -> Result<Option<CacheEntry>> {
+            Ok(self.cache.borrow().get(path).cloned())
         }
 
         fn current_exe(&self) -> Result<String> {
@@ -291,6 +284,8 @@ mod tests {
         }
     }
 
+    const FOO: &str = "secrets/foo";
+
     fn keypair() -> (::age::x25519::Identity, String, String) {
         let id = ::age::x25519::Identity::generate();
         let public = id.to_public().to_string();
@@ -309,12 +304,10 @@ mod tests {
         let id_path = workdir.join("test.key");
         std::fs::write(&id_path, &secret).unwrap();
 
-        // The clean filter's reencrypt branch reads recipients from the
-        // committed `git-agecrypt.toml`. Build one mapping secrets/foo →
-        // our test recipient.
+        // Recipients for secrets/foo come from the committed toml.
         let config_path = workdir.join("git-agecrypt.toml");
-        std::fs::write(workdir.join("secrets/foo"), "").unwrap();
-        let toml = format!("[config]\n\"secrets/foo\" = [\"{public_key}\"]\n");
+        std::fs::write(workdir.join(FOO), "").unwrap();
+        let toml = format!("[config]\n\"{FOO}\" = [\"{public_key}\"]\n");
         std::fs::write(&config_path, toml).unwrap();
 
         let ctx = TestContext {
@@ -323,120 +316,103 @@ mod tests {
                 gitdir,
                 head: RefCell::new(HashMap::new()),
             },
-            sidecars: RefCell::new(HashMap::new()),
+            cache: RefCell::new(HashMap::new()),
             identities: vec![id_path.to_string_lossy().into_owned()],
             config_path,
         };
-        let cmd = CommandContext { ctx };
-        (dir, cmd, public_key)
+        (dir, CommandContext::new(ctx), public_key)
     }
 
-    fn hash_of(plain: &[u8]) -> blake3::Hash {
-        let mut h = blake3::Hasher::new();
-        h.update(plain).finalize()
-    }
-
-    #[test]
-    fn get_content_uses_saved_when_provided() {
-        // saved_content == Some → fast path returns it verbatim, with no
-        // encryption work or sidecar mutation. This is the hot path that
-        // keeps `git status` cheap on unchanged files.
-        let (_dir, cmd, _pk) = build_fixture();
-        let target = cmd.ctx.repo.workdir.join("secrets/foo");
-        let plaintext = b"hello".to_vec();
-        let cached_ct = b"FAKE_CIPHERTEXT".to_vec();
-
-        let out = cmd
-            .get_content(
-                plaintext.clone(),
-                hash_of(&plaintext),
-                target,
-                Some(cached_ct.clone()),
-            )
-            .unwrap();
-        assert_eq!(out, cached_ct, "saved content must be used verbatim");
-        assert!(
-            cmd.ctx.sidecars.borrow().is_empty(),
-            "fast path must not touch sidecars"
+    fn cache_entry(
+        cmd: &CommandContext<TestContext>,
+        plain: &[u8],
+        recipients: [u8; 32],
+        ciphertext: &[u8],
+    ) {
+        let target = cmd.ctx.repo.workdir.join(FOO);
+        cmd.ctx.cache.borrow_mut().insert(
+            target,
+            CacheEntry {
+                plaintext_hash: *blake3::hash(plain).as_bytes(),
+                recipients,
+                ciphertext: ciphertext.to_vec(),
+            },
         );
     }
 
     #[test]
-    fn get_content_re_encrypts_when_no_head_and_no_sidecar() {
-        // First-ever clean: no saved sidecar AND nothing in HEAD → must
-        // produce fresh ciphertext and persist both sidecars.
-        let (_dir, cmd, _pk) = build_fixture();
-        let target = cmd.ctx.repo.workdir.join("secrets/foo");
-        let plaintext = b"plain".to_vec();
-        let hash = hash_of(&plaintext);
-
-        let out = cmd
-            .get_content(plaintext.clone(), hash, target.clone(), None)
-            .unwrap();
-        assert_ne!(out, plaintext, "output must be ciphertext, not plaintext");
-        assert!(
-            !out.is_empty(),
-            "ciphertext must be non-empty for non-empty input"
-        );
-        let s = cmd.ctx.sidecars.borrow();
-        assert!(
-            s.contains_key(&(target.clone(), "hash".to_string())),
-            "hash sidecar must be written"
-        );
-        assert!(
-            s.contains_key(&(target, "age".to_string())),
-            "age sidecar must be written"
-        );
-    }
-
-    #[test]
-    fn get_content_reuses_head_when_decrypted_matches() {
-        // No saved sidecar, but HEAD already has the file encrypted to
-        // the same plaintext (e.g. fresh checkout of a tracked file).
-        // The clean filter must return HEAD's ciphertext verbatim so the
-        // git index doesn't churn.
+    fn clean_reuses_cache_while_plaintext_and_recipients_match() {
+        // The hot path that keeps `git status` cheap on unchanged files.
         let (_dir, cmd, pk) = build_fixture();
-        let target = cmd.ctx.repo.workdir.join("secrets/foo");
-        let plaintext = b"stable".to_vec();
+        cache_entry(
+            &cmd,
+            b"hello",
+            cache::recipients_fingerprint(&[pk]),
+            b"CACHED",
+        );
+        let out = cmd.clean_bytes(Path::new(FOO), b"hello".to_vec()).unwrap();
+        assert_eq!(out, b"CACHED");
+    }
 
-        let head_ct = age::encrypt(&[pk], &mut &plaintext[..]).unwrap();
+    #[test]
+    fn clean_re_encrypts_when_recipients_changed() {
+        // Same plaintext, cached under another recipient set: reusing it would
+        // keep encrypting to a removed key.
+        let (_dir, cmd, _pk) = build_fixture();
+        cache_entry(&cmd, b"hello", [9; 32], b"OLD-RECIPIENTS");
+        let out = cmd.clean_bytes(Path::new(FOO), b"hello".to_vec()).unwrap();
+        assert_ne!(out, b"OLD-RECIPIENTS");
+        assert!(out.starts_with(b"age-encryption.org/v1"));
+    }
+
+    #[test]
+    fn clean_encrypts_and_caches_without_head_or_cache() {
+        let (_dir, cmd, pk) = build_fixture();
+        let out = cmd.clean_bytes(Path::new(FOO), b"plain".to_vec()).unwrap();
+        assert!(out.starts_with(b"age-encryption.org/v1"));
+        let target = cmd.ctx.repo.workdir.join(FOO);
+        let cached = cmd.ctx.cache.borrow().get(&target).cloned().unwrap();
+        assert_eq!(cached.ciphertext, out);
+        assert_eq!(cached.recipients, cache::recipients_fingerprint(&[pk]));
+    }
+
+    #[test]
+    fn clean_reuses_head_when_it_decrypts_to_the_same_plaintext() {
+        // Fresh checkout, no cache: the index must not churn.
+        let (_dir, cmd, pk) = build_fixture();
+        let head_ct = age::encrypt(&[pk], &mut &b"stable"[..]).unwrap();
         cmd.ctx
             .repo
             .head
             .borrow_mut()
-            .insert(PathBuf::from("secrets/foo"), head_ct.clone());
-
-        let out = cmd
-            .get_content(plaintext.clone(), hash_of(&plaintext), target, None)
-            .unwrap();
-        assert_eq!(
-            out, head_ct,
-            "must reuse HEAD ciphertext rather than re-encrypt"
-        );
+            .insert(PathBuf::from(FOO), head_ct.clone());
+        let out = cmd.clean_bytes(Path::new(FOO), b"stable".to_vec()).unwrap();
+        assert_eq!(out, head_ct);
     }
 
     #[test]
-    fn get_content_re_encrypts_when_head_plaintext_differs() {
-        // HEAD has the file encrypted to a *different* plaintext
-        // (the working copy edited it). Must re-encrypt the new
-        // plaintext and overwrite the sidecars.
+    fn clean_re_encrypts_when_head_plaintext_differs() {
         let (_dir, cmd, pk) = build_fixture();
-        let target = cmd.ctx.repo.workdir.join("secrets/foo");
-        let old_plain = b"old".to_vec();
-        let new_plain = b"new".to_vec();
-
-        let head_ct = age::encrypt(&[pk], &mut &old_plain[..]).unwrap();
+        let head_ct = age::encrypt(&[pk], &mut &b"old"[..]).unwrap();
         cmd.ctx
             .repo
             .head
             .borrow_mut()
-            .insert(PathBuf::from("secrets/foo"), head_ct.clone());
+            .insert(PathBuf::from(FOO), head_ct.clone());
+        let out = cmd.clean_bytes(Path::new(FOO), b"new".to_vec()).unwrap();
+        assert_ne!(out, head_ct);
+        assert!(out.starts_with(b"age-encryption.org/v1"));
+    }
 
-        let out = cmd
-            .get_content(new_plain.clone(), hash_of(&new_plain), target, None)
-            .unwrap();
-        assert_ne!(out, head_ct, "must produce fresh ciphertext, not HEAD's");
-        assert_ne!(out, new_plain, "output must be ciphertext, not plaintext");
+    #[test]
+    fn smudge_caches_with_the_current_recipients() {
+        let (_dir, cmd, pk) = build_fixture();
+        let ct = age::encrypt(std::slice::from_ref(&pk), &mut &b"secret"[..]).unwrap();
+        let out = cmd.smudge_bytes(Path::new(FOO), ct).unwrap();
+        assert_eq!(out, b"secret");
+        let target = cmd.ctx.repo.workdir.join(FOO);
+        let cached = cmd.ctx.cache.borrow().get(&target).cloned().unwrap();
+        assert_eq!(cached.recipients, cache::recipients_fingerprint(&[pk]));
     }
 
     #[test]

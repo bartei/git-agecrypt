@@ -457,16 +457,11 @@ Git invokes these driver commands per file when `.gitattributes` opts the path i
 - **`smudge`** runs on `git checkout`. Ciphertext from the index is read on stdin; plaintext is written into the working tree.
 - **`textconv`** runs on `git diff` / `git log -p`. The encrypted file is decrypted on the fly so diffs show plaintext.
 
-### Stable ciphertext via blake3 sidecars
+### Stable ciphertext via the cache
 
-Age encryption is non-deterministic: the same plaintext encrypted twice produces two different ciphertexts. Without mitigation, every `git status` / `git add` would create a fresh encrypted blob and show every encrypted file as modified. To avoid this, `clean` keeps two sidecar files per encrypted path under `.git/git-agecrypt/`:
+Age encryption is non-deterministic: the same plaintext encrypted twice produces two different ciphertexts. Without mitigation, every `git status` / `git add` would create a fresh encrypted blob and show every encrypted file as modified. To avoid this, `clean` keeps one cache entry per encrypted path under `.git/git-agecrypt/v2/` (named by the blake3 hash of the path, from vlaci/git-agecrypt 0.6): the blake3 hash of the last plaintext, a fingerprint of the recipients, and the ciphertext.
 
-- `<path>.hash` — blake3 hash of the most recent plaintext seen
-- `<path>.age`  — the ciphertext last produced for that plaintext
-
-When `clean` is invoked, it hashes the incoming plaintext. If the hash matches the saved one, the saved ciphertext is emitted verbatim — git sees no change. If the hash differs, `clean` decrypts the version currently in `HEAD` and compares it against the new plaintext; if they're equal, the HEAD ciphertext is reused. Only if both checks fail does the file get re-encrypted with fresh randomness.
-
-`smudge` populates these sidecars too, so the next `clean` on the same plaintext short-circuits.
+When `clean` sees the same plaintext for the same recipients, it emits the cached ciphertext verbatim: git sees no change. Otherwise it reuses the `HEAD` ciphertext when that decrypts to the same plaintext and the recipients are unchanged. Only then does it re-encrypt. A recipient change therefore re-encrypts every file this worktree touches. `smudge` fills the cache too. `.hash` / `.age` sidecars from earlier versions are left unused.
 
 ### Where things are stored
 
@@ -476,7 +471,7 @@ When `clean` is invoked, it hashes the incoming plaintext. If the hash matches t
 | `.gitattributes` | which paths use the filter | **Yes** — committed and shared |
 | `.git/config` (filter wiring) | absolute path to the binary | No |
 | `.git/config` (`[git-agecrypt "config"] identity`) | paths to *your* private keys | No |
-| `.git/git-agecrypt/*.{hash,age}` | per-file ciphertext + plaintext-hash cache | No |
+| `.git/git-agecrypt/v2/*` (per worktree) | per-file ciphertext, plaintext hash, recipients | No |
 
 Encryption never needs the private key, so `git-agecrypt config add -r` works on a fresh clone before any identity is configured. Decryption of course does — that's what `config add -i` is for.
 

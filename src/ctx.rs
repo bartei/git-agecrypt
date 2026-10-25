@@ -1,12 +1,16 @@
+// SPDX-FileCopyrightText: 2021 László Vaskó <opensource@vlaci.email>
+// SPDX-License-Identifier: MPL-2.0
+
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, bail};
 
 use crate::{
+    cache::{self, CacheEntry},
     config::{AgeIdentities, AgeIdentity, AppConfig, Container, GitConfig},
     git,
 };
@@ -16,9 +20,9 @@ pub(crate) trait Context {
 
     fn repo(&self) -> &Self::Repo;
 
-    fn store_sidecar(&self, for_path: &Path, extension: &str, content: &[u8]) -> Result<()>;
+    fn store_cache(&self, for_path: &Path, entry: &CacheEntry) -> Result<()>;
 
-    fn load_sidecar(&self, for_path: &Path, extension: &str) -> Result<Option<Vec<u8>>>;
+    fn load_cache(&self, for_path: &Path) -> Result<Option<CacheEntry>>;
 
     fn current_exe(&self) -> Result<String>;
 
@@ -37,32 +41,22 @@ impl<R: git::Repository> ContextWrapper<R> {
     pub(crate) fn new(repo: R) -> Self {
         Self { repo }
     }
+
     fn sidecar_directory(&self) -> PathBuf {
         self.repo.path().join("git-agecrypt")
     }
 
-    fn get_sidecar(&self, path: &Path, extension: &str) -> Result<PathBuf> {
-        let relpath = path.strip_prefix(self.repo.workdir())?;
-        // The sidecar filename has to round-trip back to this path on the
-        // next clean/smudge invocation, so a lossy UTF-8 conversion would
-        // silently collide entries (every non-UTF8 byte folds to U+FFFD).
-        // Reject explicitly instead.
-        let name = relpath
-            .to_str()
-            .ok_or_else(|| {
-                anyhow!(
-                    "Path {} is not valid UTF-8; git-agecrypt requires UTF-8 paths",
-                    relpath.display()
-                )
-            })?
-            .replace('/', "!");
+    // Cache layout, entry format and atomic writes come from vlaci/git-agecrypt
+    // 0.6 (László Vaskó, MPL-2.0). Entries are keyed by a hash of the path:
+    // bartei's `/` to `!` plus set_extension naming collided for `a.pdf` and
+    // `a.json`, and for paths containing `!`.
+    fn cache_directory(&self) -> PathBuf {
+        self.sidecar_directory().join("v2")
+    }
 
-        let dir = self.sidecar_directory();
-        fs::create_dir_all(&dir)?;
-
-        let mut rv = dir.join(name);
-        rv.set_extension(extension);
-        Ok(rv)
+    fn cache_path(&self, for_path: &Path) -> Result<PathBuf> {
+        let relpath = for_path.strip_prefix(self.repo.workdir())?;
+        Ok(self.cache_directory().join(cache::file_name(relpath)))
     }
 }
 
@@ -72,24 +66,53 @@ impl<R: git::Repository> Context for ContextWrapper<R> {
         &self.repo
     }
 
-    fn store_sidecar(&self, for_path: &Path, extension: &str, content: &[u8]) -> Result<()> {
-        let sidecar_path = self.get_sidecar(for_path, extension)?;
-        File::create(sidecar_path)?.write_all(content)?;
+    fn store_cache(&self, for_path: &Path, entry: &CacheEntry) -> Result<()> {
+        let final_path = self.cache_path(for_path)?;
+        let dir = self.cache_directory();
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir)?;
+
+        let name = final_path.file_name().context("cache entry has no name")?;
+        let tmp = dir.join(format!(
+            "{}.tmp{}",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        let write_result = (|| -> io::Result<()> {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&tmp)?.write_all(&entry.encode())?;
+            fs::rename(&tmp, &final_path)
+        })();
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
-    fn load_sidecar(&self, for_path: &Path, extension: &str) -> Result<Option<Vec<u8>>> {
-        let sidecar_path = self.get_sidecar(for_path, extension)?;
-        match File::open(sidecar_path) {
+    fn load_cache(&self, for_path: &Path) -> Result<Option<CacheEntry>> {
+        let path = self.cache_path(for_path)?;
+        match File::open(&path) {
             Ok(mut f) => {
                 let mut buff = Vec::new();
                 f.read_to_end(&mut buff)?;
-                Ok(Some(buff))
+                let entry = CacheEntry::decode(&buff);
+                if entry.is_none() {
+                    log::warn!("Ignoring unreadable cache entry {}", path.display());
+                }
+                Ok(entry)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => {
-                bail!(e)
-            }
+            Err(e) => bail!(e),
         }
     }
 
@@ -149,7 +172,7 @@ pub(crate) fn new(repo: git::LibGit2Repository) -> impl Context<Repo = git::LibG
 mod tests {
     use super::*;
 
-    /// Minimal in-memory `Repository` so the sidecar tests can pin down
+    /// Minimal in-memory `Repository` so the cache tests can pin down
     /// `workdir`/`path` without spinning up libgit2.
     struct FakeRepo {
         workdir: PathBuf,
@@ -195,64 +218,60 @@ mod tests {
         (dir, ctx)
     }
 
-    #[test]
-    fn sidecar_path_replaces_separators() {
-        let (dir, ctx) = fake_ctx();
-        let nested = dir.path().join("a/b/c.txt");
-        let p = ctx.get_sidecar(&nested, "age").unwrap();
-        // `/` (or platform separator) must be folded to `!` so each file
-        // gets a flat sidecar entry.
-        let name = p.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(name.contains('!'), "expected '!' in sidecar name: {name}");
-        assert!(name.ends_with(".age"));
+    fn entry(ciphertext: &[u8]) -> CacheEntry {
+        CacheEntry {
+            plaintext_hash: [1; 32],
+            recipients: [2; 32],
+            ciphertext: ciphertext.to_vec(),
+        }
     }
 
     #[test]
-    fn sidecar_round_trips_through_store_load() {
+    fn cache_names_are_flat_and_distinct_per_path() {
+        let (dir, ctx) = fake_ctx();
+        let name = |rel: &str| ctx.cache_path(&dir.path().join(rel)).unwrap();
+        let pdf = name("ring/E-2026-0042.pdf");
+        assert_eq!(pdf.parent().unwrap(), ctx.cache_directory());
+        // Same stem, other extension: bartei's naming mapped both to one entry.
+        assert_ne!(pdf, name("ring/E-2026-0042.json"));
+        // `!` in a path: the old `/` to `!` folding mapped both to one entry.
+        assert_ne!(name("a!b/c"), name("a/b!c"));
+    }
+
+    #[test]
+    fn cache_round_trips_through_store_load() {
         let (dir, ctx) = fake_ctx();
         let target = dir.path().join("secrets/note.txt");
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        ctx.store_sidecar(&target, "age", b"ciphertext").unwrap();
-        let loaded = ctx.load_sidecar(&target, "age").unwrap();
-        assert_eq!(loaded.as_deref(), Some(&b"ciphertext"[..]));
+        ctx.store_cache(&target, &entry(b"ciphertext")).unwrap();
+        let loaded = ctx.load_cache(&target).unwrap().unwrap();
+        assert_eq!(loaded.ciphertext, b"ciphertext");
+        assert_eq!(loaded.recipients, [2; 32]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, ctx) = fake_ctx();
+        let target = dir.path().join("secrets/note.txt");
+        ctx.store_cache(&target, &entry(b"x")).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&ctx.cache_path(&target).unwrap()), 0o600);
+        assert_eq!(mode(&ctx.cache_directory()), 0o700);
     }
 
     #[test]
-    fn load_sidecar_returns_none_when_missing() {
+    fn load_cache_returns_none_when_missing() {
         let (dir, ctx) = fake_ctx();
         let target = dir.path().join("never-stored.txt");
-        let loaded = ctx.load_sidecar(&target, "age").unwrap();
-        assert!(loaded.is_none());
+        assert!(ctx.load_cache(&target).unwrap().is_none());
     }
 
     #[test]
     fn remove_sidecar_files_is_idempotent_when_absent() {
         let (_dir, ctx) = fake_ctx();
-        // No sidecar dir exists yet — must not error.
+        // No cache dir exists yet — must not error.
         ctx.remove_sidecar_files().unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sidecar_rejects_non_utf8_relpath() {
-        // On Unix paths can hold arbitrary bytes; lossy conversion would
-        // collide entries by folding to U+FFFD.
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let (dir, ctx) = fake_ctx();
-        let bytes: &[u8] = b"weird-\xff\xfe.txt";
-        let mut path = dir.path().to_path_buf();
-        path.push(OsStr::from_bytes(bytes));
-
-        let err = ctx
-            .get_sidecar(&path, "age")
-            .expect_err("non-UTF8 relpath must error");
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("not valid UTF-8"),
-            "error must mention UTF-8: {msg}"
-        );
     }
 
     #[test]

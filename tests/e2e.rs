@@ -920,3 +920,48 @@ fn config_add_invalid_listed_marker_when_identity_breaks() {
         "broken identity should be marked invalid; got:\n{listed}"
     );
 }
+
+fn staged_bytes(fx: &Fixture, rel: &str) -> Vec<u8> {
+    cmd("git", ["cat-file", "blob", &format!(":{rel}")])
+        .dir(fx.workdir())
+        .stdout_capture()
+        .run()
+        .unwrap()
+        .stdout
+}
+
+fn opens_with(blob: &[u8], identity: &age::x25519::Identity) -> bool {
+    age::Decryptor::new(blob)
+        .and_then(|d| d.decrypt(std::iter::once(identity as &dyn age::Identity)))
+        .is_ok()
+}
+
+#[test]
+fn same_stem_files_keep_their_own_recipients() {
+    // Sidecars named `a.hash` / `a.age` once served both a.json and a.pdf:
+    // equal content got the other file's ciphertext, and its recipients.
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    let other = age::x25519::Identity::generate();
+    fx.write("secrets/a.json", "same");
+    fx.write("secrets/a.pdf", "same");
+    fx.run_ok(&[
+        "config",
+        "add",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "secrets/a.json",
+    ]);
+    let other_pub = other.to_public().to_string();
+    fx.run_ok(&["config", "add", "-r", &other_pub, "-p", "secrets/a.pdf"]);
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/a.json",
+    ]);
+    fx.git(&["add", "secrets/a.pdf"]);
+    assert!(opens_with(&staged_bytes(&fx, "secrets/a.pdf"), &other));
+}
