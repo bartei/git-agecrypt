@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::{
-    fs::File,
-    io::{self, Read, Seek, Write},
+    fs,
+    io::{self, Read, Write},
     path::Path,
 };
 
@@ -17,6 +17,8 @@ use crate::{
     git::Repository,
 };
 
+type Identities = Vec<Box<dyn ::age::Identity>>;
+
 pub(crate) struct CommandContext<C: Context> {
     pub ctx: C,
 }
@@ -24,6 +26,10 @@ pub(crate) struct CommandContext<C: Context> {
 impl<C: Context> CommandContext<C> {
     pub(crate) fn new(ctx: C) -> Self {
         Self { ctx }
+    }
+
+    fn identities(&self) -> Result<Identities> {
+        age::load_identities(&self.get_identities()?)
     }
 
     pub(crate) fn clean(&self, file: impl AsRef<Path>) -> Result<()> {
@@ -90,7 +96,7 @@ impl<C: Context> CommandContext<C> {
             }
             Err(e) => return Err(e.into()),
         };
-        let decrypted = age::decrypt(&self.get_identities()?, &mut &head[..])?.unwrap_or_default();
+        let decrypted = age::decrypt_with(&self.identities()?, &head)?.unwrap_or_default();
         Ok((decrypted == contents).then_some(head))
     }
 
@@ -122,7 +128,7 @@ impl<C: Context> CommandContext<C> {
         log::info!("Decrypting file");
         let file = self.ctx.repo().workdir().join(file);
 
-        let Some(rv) = age::decrypt(&self.get_identities()?, &mut &encrypted[..])? else {
+        let Some(rv) = age::decrypt_with(&self.identities()?, &encrypted)? else {
             bail!("Input isn't encrypted")
         };
         log::info!("Decrypted file");
@@ -140,25 +146,13 @@ impl<C: Context> CommandContext<C> {
 
     pub(crate) fn textconv(&self, path: impl AsRef<Path>) -> Result<()> {
         log::info!("Decrypting file to show in diff");
-
-        let all_identities: Vec<String> = self
-            .ctx
-            .age_identities()
-            .list()?
-            .into_iter()
-            .map(|i| i.path)
-            .collect();
-
-        let mut f = File::open(path)?;
-        let result = if let Some(rv) = age::decrypt(&all_identities, &mut f)? {
-            log::info!("Decrypted file to show in diff");
-            rv
-        } else {
-            log::info!("File isn't encrypted, probably a working copy; showing as is.");
-            f.rewind()?;
-            let mut buff = vec![];
-            f.read_to_end(&mut buff)?;
-            buff
+        let data = fs::read(path)?;
+        let result = match age::decrypt_with(&self.identities()?, &data)? {
+            Some(rv) => rv,
+            None => {
+                log::info!("File isn't encrypted, probably a working copy; showing as is.");
+                data
+            }
         };
         Ok(io::stdout().write_all(&result)?)
     }

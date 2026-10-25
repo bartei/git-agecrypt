@@ -11,45 +11,63 @@ use age::{
 };
 use anyhow::{Context, Result, bail};
 
+#[cfg(test)]
 pub(crate) fn decrypt(
     identities: &[impl AsRef<Path>],
     encrypted: &mut impl Read,
 ) -> Result<Option<Vec<u8>>> {
-    let id = load_identities(identities)?;
-    let id = id.iter().map(|i| i.as_ref() as &dyn Identity);
-    let mut decrypted = vec![];
-    let decryptor = match Decryptor::new(ArmoredReader::new(encrypted)) {
+    let mut data = vec![];
+    encrypted.read_to_end(&mut data)?;
+    decrypt_with(&load_identities(identities)?, &data)
+}
+
+type SliceDecryptor<'a> = Decryptor<ArmoredReader<io::BufReader<&'a [u8]>>>;
+
+fn decryptor(data: &[u8]) -> Result<Option<SliceDecryptor<'_>>> {
+    match Decryptor::new(ArmoredReader::new(data)) {
         Ok(d) if d.is_scrypt() => bail!("Passphrase encrypted files are not supported"),
-        Ok(d) => d,
-        Err(DecryptError::InvalidHeader) => return Ok(None),
-        Err(DecryptError::Io(e)) => {
-            match e.kind() {
-                // Age gives unexpected EOF when the file contains not enough data
-                IoErrorKind::UnexpectedEof => return Ok(None),
-                _ => bail!(e),
-            }
-        }
+        Ok(d) => Ok(Some(d)),
+        Err(DecryptError::InvalidHeader) => Ok(None),
+        // Age gives unexpected EOF when the file contains not enough data
+        Err(DecryptError::Io(e)) if e.kind() == IoErrorKind::UnexpectedEof => Ok(None),
         Err(e) => {
             log::error!("Decryption error: {e:?}");
             bail!(e)
         }
-    };
-
-    let mut reader = decryptor.decrypt(id)?;
-    reader.read_to_end(&mut decrypted)?;
-    Ok(Some(decrypted))
+    }
 }
 
-/// True when `data` is an age file whose line endings were rewritten to CRLF.
-/// git does that to blobs it takes for text (a short ciphertext with no NUL or
-/// control byte) when `core.autocrlf` is on and the path is not `-text`; the
-/// result is not valid age any more.
-pub(crate) fn crlf_rewritten(data: &[u8]) -> bool {
-    data.starts_with(b"age-encryption.org/v1\r\n")
-        || data.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----\r\n")
+/// Decrypt with identities already in memory, so a long-running filter loads
+/// them once. `None` when `data` is not age. Each identity is tried on its own:
+/// in one decryptor, a plugin identity that errors (absent plugin, another
+/// holder's key) aborts before the working key behind it is even tried.
+pub(crate) fn decrypt_with(
+    identities: &[Box<dyn Identity>],
+    data: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    if decryptor(data)?.is_none() {
+        return Ok(None);
+    }
+    let mut failure = None;
+    for identity in identities {
+        let decryptor = decryptor(data)?.context("age header vanished")?;
+        match decryptor.decrypt(std::iter::once(identity.as_ref() as &dyn Identity)) {
+            Ok(mut reader) => {
+                let mut decrypted = vec![];
+                reader.read_to_end(&mut decrypted)?;
+                return Ok(Some(decrypted));
+            }
+            Err(DecryptError::NoMatchingKeys) => {}
+            Err(e) => failure = Some(e),
+        }
+    }
+    Err(match failure {
+        Some(e) => anyhow::anyhow!(e).context("no identity could decrypt; one of them failed"),
+        None => anyhow::anyhow!(DecryptError::NoMatchingKeys),
+    })
 }
 
-fn load_identities(identities: &[impl AsRef<Path>]) -> Result<Vec<Box<dyn Identity>>> {
+pub(crate) fn load_identities(identities: &[impl AsRef<Path>]) -> Result<Vec<Box<dyn Identity>>> {
     // age::cli_common::read_identities takes Vec<String>, so the path has
     // to round-trip through UTF-8. Lossy conversion would silently change
     // the bytes age then opens — fail explicitly instead.
