@@ -339,9 +339,8 @@ $ git-agecrypt config add \
     -r age1jrnk…2qzp \
     -p secrets/api-token secrets/db.env
 
-# 2. Touch each affected file so the next commit re-encrypts to the
-#    expanded recipient set. (`cat … > …` rewrites mtime in place.)
-$ for f in secrets/api-token secrets/db.env; do cp "$f" "$f.tmp" && mv "$f.tmp" "$f"; done
+# 2. Re-encrypt the affected files to the expanded recipient set.
+$ git-agecrypt rekey secrets/api-token secrets/db.env
 
 # 3. Commit and push.
 $ git add git-agecrypt.toml secrets/api-token secrets/db.env
@@ -363,8 +362,8 @@ $ git checkout -- secrets/   # smudge filter decrypts on checkout
 
 ```console
 $ git-agecrypt config remove -r age1jrnk…2qzp
-# Re-touch every file so it gets re-encrypted to the reduced recipient set.
-$ git ls-files | xargs -I {} sh -c 'grep -q git-agecrypt .gitattributes && cp "{}" "{}.tmp" && mv "{}.tmp" "{}"' || true
+# Re-encrypt every encrypted file to the reduced recipient set.
+$ git-agecrypt rekey
 $ git add -A && git commit -m "revoke bob"
 $ git push
 ```
@@ -461,7 +460,7 @@ Git invokes these driver commands per file when `.gitattributes` opts the path i
 
 Age encryption is non-deterministic: the same plaintext encrypted twice produces two different ciphertexts. Without mitigation, every `git status` / `git add` would create a fresh encrypted blob and show every encrypted file as modified. To avoid this, `clean` keeps one cache entry per encrypted path under `.git/git-agecrypt/v2/` (named by the blake3 hash of the path, from vlaci/git-agecrypt 0.6): the blake3 hash of the last plaintext, a fingerprint of the recipients, and the ciphertext.
 
-When `clean` sees the same plaintext for the same recipients, it emits the cached ciphertext verbatim: git sees no change. Otherwise it reuses the `HEAD` ciphertext when that decrypts to the same plaintext and the recipients are unchanged. Only then does it re-encrypt. A recipient change therefore re-encrypts every file this worktree touches. `smudge` fills the cache too. `.hash` / `.age` sidecars from earlier versions are left unused.
+When `clean` sees the same plaintext for the same recipients, it emits the cached ciphertext verbatim: git sees no change. Otherwise it reuses the `HEAD` ciphertext when that decrypts to the same plaintext and the recipients are unchanged. Only then does it re-encrypt. A recipient change therefore re-encrypts every file this worktree touches; `rekey` forces the rest. `smudge` fills the cache too. `.hash` / `.age` sidecars from earlier versions are left unused.
 
 ### Where things are stored
 

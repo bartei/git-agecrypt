@@ -36,6 +36,12 @@ pub enum PublicCommands {
 
     /// Remove repository specific configuration
     Deinit,
+
+    /// Re-encrypt files to the recipients configured
+    Rekey {
+        /// Paths to rekey; all encrypted files when empty
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]

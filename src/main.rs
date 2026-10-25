@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod ctx;
 mod git;
+mod gitcli;
 
 use anyhow::Result;
 use cli::run;

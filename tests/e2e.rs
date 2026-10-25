@@ -965,3 +965,25 @@ fn same_stem_files_keep_their_own_recipients() {
     fx.git(&["add", "secrets/a.pdf"]);
     assert!(opens_with(&staged_bytes(&fx, "secrets/a.pdf"), &other));
 }
+
+#[test]
+fn rekey_moves_unchanged_files_to_new_recipients() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    fx.write("secrets/s.txt", "secret");
+    fx.add_recipient_for("s.txt");
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/s.txt",
+    ]);
+    fx.git(&["commit", "-m", "secret"]);
+    let other = age::x25519::Identity::generate();
+    let other_pub = other.to_public().to_string();
+    fx.run_ok(&["config", "add", "-r", &other_pub, "-p", "secrets/s.txt"]);
+    assert!(!opens_with(&staged_bytes(&fx, "secrets/s.txt"), &other));
+    assert!(fx.run_ok(&["rekey"]).contains("Re-encrypted secrets/s.txt"));
+    assert!(opens_with(&staged_bytes(&fx, "secrets/s.txt"), &other));
+}

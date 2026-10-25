@@ -1,10 +1,13 @@
+// SPDX-FileCopyrightText: 2021 László Vaskó <opensource@vlaci.email>
+// SPDX-License-Identifier: MPL-2.0
+
 use std::path::PathBuf;
 
 use crate::{Result, git};
 
 use crate::config::Validated;
 use crate::git::Repository;
-use crate::{config::AgeIdentity, ctx::Context};
+use crate::{cache::CacheEntry, config::AgeIdentity, ctx::Context, gitcli};
 
 pub(crate) struct CommandContext<C: Context> {
     ctx: C,
@@ -103,6 +106,34 @@ impl<C: Context> CommandContext<C> {
         Ok(())
     }
 }
+
+/// Force re-encryption to the configured recipients, from vlaci/git-agecrypt
+/// 0.6 (László Vaskó, MPL-2.0): mark the cache, then let `git add
+/// --renormalize` run clean on every target.
+pub(crate) fn rekey<C: Context>(ctx: &C, paths: Vec<PathBuf>) -> Result<()> {
+    let root = ctx.repo().workdir().to_path_buf();
+    let specs: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+    let mut targets: Vec<String> = gitcli::filtered(&root, &gitcli::tracked(&root, &specs)?)?
+        .into_iter()
+        .collect();
+    targets.sort();
+    if targets.is_empty() {
+        anyhow::bail!("no tracked file under the git-agecrypt filter matches");
+    }
+    for rel in &targets {
+        ctx.store_cache(&root.join(rel), &CacheEntry::force_reencrypt())?;
+    }
+    gitcli::run_with_paths(&root, &["add", "--renormalize"], &targets)?;
+    for rel in &targets {
+        println!("Re-encrypted {rel}");
+    }
+    Ok(())
+}
+
 fn ensure_state(result: git::Result<()>) -> Result<()> {
     match result {
         Ok(()) => Ok(()),

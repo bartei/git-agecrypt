@@ -7,6 +7,7 @@ use std::path::Path;
 const MAGIC: &[u8; 8] = b"GACACHE1";
 
 pub(crate) const UNKNOWN_RECIPIENTS: [u8; 32] = [0x00; 32];
+pub(crate) const FORCE_REENCRYPT: [u8; 32] = [0xff; 32];
 
 #[derive(Clone)]
 pub(crate) struct CacheEntry {
@@ -16,6 +17,14 @@ pub(crate) struct CacheEntry {
 }
 
 impl CacheEntry {
+    pub fn force_reencrypt() -> Self {
+        Self {
+            plaintext_hash: [0; 32],
+            recipients: FORCE_REENCRYPT,
+            ciphertext: vec![],
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(8 + 32 + 32 + self.ciphertext.len());
         buf.extend_from_slice(MAGIC);
