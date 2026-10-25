@@ -81,17 +81,25 @@ pub struct AddConfig {
     /// patterns are accepted without an existing file.
     #[arg(short, long, num_args = 1..)]
     path: Option<Vec<PathBuf>>,
+
+    /// Store the recipients under this name in [keys] and list the name on
+    /// the paths, e.g. `--name teo`
+    #[arg(short, long, requires = "recipient")]
+    name: Option<String>,
 }
 
 pub(crate) enum ModifyConfig {
     Identity(PathBuf),
     Recipient(Vec<PathBuf>, Vec<String>),
+    Named(String, Vec<PathBuf>, Vec<String>),
 }
 
 impl From<AddConfig> for ModifyConfig {
     fn from(val: AddConfig) -> Self {
         if let Some(identity) = val.identity {
             Self::Identity(identity)
+        } else if let (Some(recipients), Some(name)) = (val.recipient.clone(), val.name) {
+            Self::Named(name, val.path.unwrap(), recipients)
         } else if let Some(recipients) = val.recipient {
             Self::Recipient(val.path.unwrap(), recipients)
         } else {
@@ -239,6 +247,7 @@ mod tests {
         match ModifyConfig::from(add) {
             ModifyConfig::Identity(p) => assert_eq!(p, PathBuf::from("/tmp/some.key")),
             ModifyConfig::Recipient(..) => panic!("expected identity variant"),
+            ModifyConfig::Named(..) => panic!("expected identity variant"),
         }
     }
 
@@ -267,6 +276,7 @@ mod tests {
                 assert_eq!(recipients, vec!["age1example".to_string()]);
             }
             ModifyConfig::Identity(_) => panic!("expected recipient variant"),
+            ModifyConfig::Named(..) => panic!("expected recipient variant"),
         }
     }
 
@@ -287,6 +297,7 @@ mod tests {
         match ModifyConfig::from(rm) {
             ModifyConfig::Identity(p) => assert_eq!(p, PathBuf::from("/tmp/some.key")),
             ModifyConfig::Recipient(..) => panic!("expected identity variant"),
+            ModifyConfig::Named(..) => panic!("expected identity variant"),
         }
     }
 
@@ -305,6 +316,7 @@ mod tests {
                 assert_eq!(recipients, vec!["age1example".to_string()]);
             }
             ModifyConfig::Identity(_) => panic!("expected recipient variant"),
+            ModifyConfig::Named(..) => panic!("expected recipient variant"),
         }
     }
 
@@ -323,6 +335,7 @@ mod tests {
                 assert!(recipients.is_empty());
             }
             ModifyConfig::Identity(_) => panic!("expected recipient variant"),
+            ModifyConfig::Named(..) => panic!("expected recipient variant"),
         }
     }
 

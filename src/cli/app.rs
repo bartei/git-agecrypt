@@ -45,12 +45,16 @@ fn run_public_command(commands: PublicCommands, ctx: impl Context) -> Result<()>
                 ModifyConfig::Recipient(paths, recipients) => {
                     cmd.add_recipients(recipients, paths)?
                 }
+                ModifyConfig::Named(name, paths, recipients) => {
+                    cmd.add_named(name, recipients, paths)?
+                }
             },
             super::args::ConfigCommands::Remove(what) => match ModifyConfig::from(what) {
                 ModifyConfig::Identity(id) => cmd.remove_identity(id)?,
                 ModifyConfig::Recipient(paths, recipients) => {
                     cmd.remove_recipients(recipients, paths)?
                 }
+                ModifyConfig::Named(..) => unreachable!("remove takes no --name"),
             },
             super::args::ConfigCommands::List(what) => match QueryConfig::from(what) {
                 QueryConfig::Identities => cmd.list_identities()?,

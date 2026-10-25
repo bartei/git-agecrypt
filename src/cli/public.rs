@@ -88,6 +88,18 @@ impl<C: Context> CommandContext<C> {
         Ok(())
     }
 
+    pub fn add_named(
+        &self,
+        name: String,
+        recipients: Vec<String>,
+        paths: Vec<PathBuf>,
+    ) -> Result<()> {
+        let mut cfg = self.ctx.config()?;
+        cfg.add_named(name, recipients, paths)?;
+        cfg.save()?;
+        Ok(())
+    }
+
     pub fn remove_recipients(&self, recipients: Vec<String>, paths: Vec<PathBuf>) -> Result<()> {
         let mut cfg = self.ctx.config()?;
         cfg.remove(recipients, paths)?;

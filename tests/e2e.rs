@@ -1016,3 +1016,42 @@ fn process_filter_round_trips() {
     fx.git(&["checkout", "--", "secrets/secret.txt"]);
     assert_eq!(fx.read("secrets/secret.txt"), "through the process filter");
 }
+
+#[test]
+fn key_names_encrypt_to_their_keys_and_edits_keep_comments() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    fx.write("git-agecrypt.toml", "# who reads what\n[config]\n");
+    fx.write("secrets/s.txt", "named");
+    fx.run_ok(&[
+        "config",
+        "add",
+        "--name",
+        "teo",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "secrets/s.txt",
+    ]);
+    let toml = fx.read("git-agecrypt.toml");
+    assert!(toml.contains("# who reads what"), "{toml}");
+    assert!(
+        toml.contains(&format!("teo = \"{}\"", fx.public_key)),
+        "{toml}"
+    );
+    assert!(toml.contains("\"secrets/s.txt\" = [\"teo\"]"), "{toml}");
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/s.txt",
+    ]);
+    let secret = fs::read_to_string(&fx.identity_path).unwrap();
+    let identity: age::x25519::Identity = secret.trim().parse().unwrap();
+    assert!(opens_with(&staged_bytes(&fx, "secrets/s.txt"), &identity));
+    // Removing the key itself would leave it granted through the name.
+    let out = fx.run(&["config", "remove", "-r", &fx.public_key]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("[keys] teo"));
+}

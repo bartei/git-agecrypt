@@ -933,7 +933,8 @@ dependencies = [
  "rstest",
  "serde",
  "thiserror 2.0.21",
- "toml 1.1.8+spec-1.1.0",
+ "toml 1.1.6+spec-1.1.0",
+ "toml_edit",
 ]
 
 [[package]]
@@ -2238,6 +2239,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
