@@ -134,7 +134,7 @@ impl Fixture {
         self.run_ok(&["init"]);
         fs::write(
             self.workdir().join(".gitattributes"),
-            "secrets/* filter=git-agecrypt diff=git-agecrypt\n",
+            "secrets/* filter=git-agecrypt diff=git-agecrypt -text\n",
         )
         .unwrap();
     }
@@ -654,7 +654,7 @@ fn glob_recipient_encrypts_matching_files_at_any_depth() {
     fx.add_identity();
     fs::write(
         fx.workdir().join(".gitattributes"),
-        "**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt\n",
+        "**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt -text\n",
     )
     .unwrap();
     fx.run_ok(&[
@@ -719,7 +719,7 @@ fn glob_and_literal_recipients_merge_for_matching_file() {
 
     fs::write(
         fx.workdir().join(".gitattributes"),
-        "**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt\n",
+        "**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt -text\n",
     )
     .unwrap();
 

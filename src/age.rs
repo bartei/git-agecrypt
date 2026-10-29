@@ -40,6 +40,15 @@ pub(crate) fn decrypt(
     Ok(Some(decrypted))
 }
 
+/// True when `data` is an age file whose line endings were rewritten to CRLF.
+/// git does that to blobs it takes for text (a short ciphertext with no NUL or
+/// control byte) when `core.autocrlf` is on and the path is not `-text`; the
+/// result is not valid age any more.
+pub(crate) fn crlf_rewritten(data: &[u8]) -> bool {
+    data.starts_with(b"age-encryption.org/v1\r\n")
+        || data.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----\r\n")
+}
+
 fn load_identities(identities: &[impl AsRef<Path>]) -> Result<Vec<Box<dyn Identity>>> {
     // age::cli_common::read_identities takes Vec<String>, so the path has
     // to round-trip through UTF-8. Lossy conversion would silently change
@@ -218,6 +227,22 @@ mod tests {
         let mut cur = Cursor::new(ciphertext);
         let result = decrypt(&[other_id_path], &mut cur);
         assert!(result.is_err(), "wrong identity must error on decrypt");
+    }
+
+    #[test]
+    fn crlf_rewritten_detects_both_age_formats() {
+        assert!(crlf_rewritten(
+            b"age-encryption.org/v1\r\n-> X25519 abc\r\n"
+        ));
+        assert!(crlf_rewritten(
+            b"-----BEGIN AGE ENCRYPTED FILE-----\r\nYWdl\r\n"
+        ));
+        assert!(!crlf_rewritten(b"age-encryption.org/v1\n-> X25519 abc\n"));
+        assert!(!crlf_rewritten(
+            b"-----BEGIN AGE ENCRYPTED FILE-----\nYWdl\n"
+        ));
+        assert!(!crlf_rewritten(b"plain text\r\n"));
+        assert!(!crlf_rewritten(b""));
     }
 
     #[test]

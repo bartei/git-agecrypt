@@ -116,6 +116,15 @@ impl<C: Context> CommandContext<C> {
 
         let mut encrypted = vec![];
         io::stdin().read_to_end(&mut encrypted)?;
+        if age::crlf_rewritten(&encrypted) {
+            bail!(
+                "{} looks like an age file whose line endings were rewritten (CRLF), so it \
+                 cannot be decrypted: git treated the ciphertext as text. Add `-text` to the \
+                 path's .gitattributes entry (e.g. `secrets/* filter=git-agecrypt \
+                 diff=git-agecrypt -text`) and check the file out again.",
+                file.display()
+            );
+        }
         let mut cur = io::Cursor::new(encrypted);
         let all_identities = self.get_identities()?;
         if let Some(rv) = age::decrypt(&all_identities, &mut cur)? {
