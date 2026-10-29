@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::ctx::Context;
 
-use super::{internal, public};
+use super::{internal, process, public};
 
 use super::args::{Args, Commands, InternalCommands, ModifyConfig, PublicCommands, QueryConfig};
 
@@ -14,20 +14,22 @@ pub(crate) fn run(args: Args, ctx: impl Context) -> Result<()> {
 }
 
 fn run_internal_command(commands: InternalCommands, ctx: impl Context) -> Result<()> {
-    let cmd = internal::CommandContext { ctx };
+    let cmd = internal::CommandContext::new(ctx);
     match commands {
         InternalCommands::Clean { file } => cmd.clean(file),
         InternalCommands::Smudge { file } => cmd.smudge(file),
         InternalCommands::Textconv { path } => cmd.textconv(path),
+        InternalCommands::Process => process::serve(&cmd),
     }
 }
 
 fn run_public_command(commands: PublicCommands, ctx: impl Context) -> Result<()> {
     let cmd = public::CommandContext::new(ctx);
     match commands {
-        PublicCommands::Init => {
-            cmd.init()?;
+        PublicCommands::Init { process } => {
+            cmd.init(process)?;
         }
+        PublicCommands::Rekey { paths } => cmd.rekey(paths)?,
         PublicCommands::Deinit => {
             cmd.deinit()?;
         }
@@ -40,12 +42,16 @@ fn run_public_command(commands: PublicCommands, ctx: impl Context) -> Result<()>
                 ModifyConfig::Recipient(paths, recipients) => {
                     cmd.add_recipients(recipients, paths)?
                 }
+                ModifyConfig::Named(name, paths, recipients) => {
+                    cmd.add_named(name, recipients, paths)?
+                }
             },
             super::args::ConfigCommands::Remove(what) => match ModifyConfig::from(what) {
                 ModifyConfig::Identity(id) => cmd.remove_identity(id)?,
                 ModifyConfig::Recipient(paths, recipients) => {
                     cmd.remove_recipients(recipients, paths)?
                 }
+                ModifyConfig::Named(..) => unreachable!("remove takes no --name"),
             },
             super::args::ConfigCommands::List(what) => match QueryConfig::from(what) {
                 QueryConfig::Identities => cmd.list_identities()?,

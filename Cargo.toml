@@ -28,6 +28,7 @@ regex = "1.12.3"
 serde = { version = "1.0.228", features = [ "derive" ] }
 thiserror = "2.0.18"
 toml = "1.1.2"
+toml_edit = "0.25.15"
 
 [features]
 

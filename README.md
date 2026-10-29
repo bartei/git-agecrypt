@@ -102,7 +102,7 @@ $ git-agecrypt config add \
     -p secrets/api-token
 
 # 5. Tell git which paths the filter applies to. .gitattributes is committed.
-$ echo 'secrets/* filter=git-agecrypt diff=git-agecrypt' >> .gitattributes
+$ echo 'secrets/* filter=git-agecrypt diff=git-agecrypt -text' >> .gitattributes
 
 # 6. Commit. The blob in git is encrypted; your working copy is plaintext.
 $ git add .gitattributes git-agecrypt.toml secrets/api-token
@@ -111,6 +111,13 @@ $ git commit -m "encrypted api-token"
 # 7. Verify: this prints ciphertext (starts with "age-encryption.org/v1").
 $ git show HEAD:secrets/api-token
 ```
+
+> **Always include `-text`.** Age ciphertext is binary, but a short one can
+> happen to contain no NUL or control bytes, and git's text heuristic then
+> treats it as text. With `core.autocrlf=true` (the Git for Windows default)
+> git rewrites its line endings before `smudge` runs, and the checkout fails
+> with "line endings were rewritten (CRLF)". `-text` switches end-of-line
+> conversion off for the path, independently of `core.autocrlf`.
 
 After cloning the repo on another machine, run `git-agecrypt init` once and `git-agecrypt config add -i <path-to-private-key>` — the recipients in `git-agecrypt.toml` are already there. `git checkout` will decrypt back to plaintext automatically.
 
@@ -124,6 +131,12 @@ Wires `git-agecrypt` into the current repository as a clean / smudge / textconv 
 
 ```console
 $ git-agecrypt init
+```
+
+With `--process`, `init` also registers git's [long-running filter process](https://git-scm.com/docs/gitattributes#_long_running_filter_process) (`filter.git-agecrypt.process`). git then starts **one** `git-agecrypt` per git command instead of one per file, so identities — and any `identityCommand` — load once per `git checkout` / `git add` rather than once per file. Repos with many encrypted files get noticeably faster. git prefers the process entry when both are configured; run `init` again without the flag to go back to per-file clean/smudge.
+
+```console
+$ git-agecrypt init --process
 ```
 
 ### `git-agecrypt deinit`
@@ -184,6 +197,17 @@ The following identities are currently configured:
     ✓ /home/alice/.config/age/personal.key
     ✓ /home/alice/.ssh/id_ed25519
 ```
+
+### `identityCommand` — load an identity from a secret manager
+
+Instead of a key file on disk, `git-agecrypt` can run a command that prints an age identity file and use its output. Set it in `.git/config` (local, never committed); several entries are allowed and combine with `config add -i` identities:
+
+```console
+$ git config --add git-agecrypt.config.identityCommand 'op read "op://Private/git-agecrypt/identity"'
+$ git config --add git-agecrypt.config.identityCommand 'pass show git-agecrypt/identity'
+```
+
+The command runs through `sh -c` on Unix and `cmd /C` on Windows, with stdin closed and stderr attached (so an unlock prompt still reaches you). It runs once per `git-agecrypt` process: once per file with the default wiring, once per git command with `init --process`. A failing command fails the git operation with the command named in the error. The output is held in memory only for the lifetime of the process and zeroed afterwards.
 
 ### `git-agecrypt config add -r <recipient> -p <path>...` — add an encryption recipient
 
@@ -274,18 +298,38 @@ Resulting `git-agecrypt.toml`:
 **Glob entries pair with `.gitattributes` exactly as literal entries do.** `.gitattributes` decides *which* paths run through the filter; `git-agecrypt.toml` decides *who they're encrypted for*. Both files need to agree:
 
 ```gitattributes
-**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt
+**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt -text
 ```
 
 After the first `config add`, edit `.gitattributes` (a regular committed file) so git knows which paths use this filter:
 
 ```gitattributes
-secrets/**          filter=git-agecrypt diff=git-agecrypt
-config/*.env        filter=git-agecrypt diff=git-agecrypt
-**/*.secret.yaml    filter=git-agecrypt diff=git-agecrypt
+secrets/**          filter=git-agecrypt diff=git-agecrypt -text
+config/*.env        filter=git-agecrypt diff=git-agecrypt -text
+**/*.secret.yaml    filter=git-agecrypt diff=git-agecrypt -text
 ```
 
 > Filters are applied to files, not directories — write `secrets/**` (or list specific files) rather than `secrets/`.
+
+### Key names — `--name` and `[keys]`
+
+Recipients are long and anonymous. `--name` stores them under a name in a `[keys]` table of `git-agecrypt.toml` and lists the **name** on the paths, so the rings read as people:
+
+```console
+$ git-agecrypt config add --name alice -r age1qz5y…0p7w -p secrets/api-token
+$ git-agecrypt config add --name ci -r age1jrnk…2qzp age1c7m9…9xk2 -p secrets/api-token
+```
+
+```toml
+[keys]
+alice = "age1qz5y…0p7w"
+ci = ["age1jrnk…2qzp", "age1c7m9…9xk2"]
+
+[config]
+"secrets/api-token" = ["alice", "ci"]
+```
+
+Names are plain words (letters, digits, `_`, `-`) and may not look like a recipient. Adding `--name` again for an existing name appends to its keys. A name that is listed on a path but missing from `[keys]` fails the commit with `unknown key name`, rather than silently encrypting to fewer people. `config remove -r <name> -p <path>` drops the name from a path; removing one of a name's recipients directly is refused, because the key would stay granted through the name — edit `[keys]` by hand for that. Edits keep the rest of the file as you wrote it: comments, multi-line arrays and unrelated tables survive.
 
 ### `git-agecrypt config remove -r <recipient>` — remove a recipient
 
@@ -316,9 +360,18 @@ The following recipients are configured:
     secrets/db.env:    age1qz5y…0p7w
 ```
 
+### `git-agecrypt rekey [<path>...]` — re-encrypt to the current recipients
+
+After adding or removing a recipient, files whose plaintext did not change would keep their old ciphertext (and old recipients) in the index. `rekey` marks the given paths — all encrypted files when none are given — and runs `git add --renormalize` on them, so `clean` encrypts them again to the recipients now in `git-agecrypt.toml`. Paths are pathspecs relative to the current directory, like git's own. Commit afterwards.
+
+```console
+$ git-agecrypt rekey                       # everything under the filter
+$ git-agecrypt rekey secrets/api-token     # just this file
+```
+
 ### Internal subcommands
 
-`git-agecrypt clean`, `smudge`, and `textconv` are invoked by git itself via the filter wiring set up by `init`. You should not need to call them directly. They are hidden from `--help` to keep the user-facing CLI small.
+`git-agecrypt clean`, `smudge`, `textconv` and `process` are invoked by git itself via the filter wiring set up by `init`. You should not need to call them directly. They are hidden from `--help` to keep the user-facing CLI small.
 
 ## Common workflows
 
@@ -332,9 +385,8 @@ $ git-agecrypt config add \
     -r age1jrnk…2qzp \
     -p secrets/api-token secrets/db.env
 
-# 2. Touch each affected file so the next commit re-encrypts to the
-#    expanded recipient set. (`cat … > …` rewrites mtime in place.)
-$ for f in secrets/api-token secrets/db.env; do cp "$f" "$f.tmp" && mv "$f.tmp" "$f"; done
+# 2. Re-encrypt the affected files to the expanded recipient set.
+$ git-agecrypt rekey secrets/api-token secrets/db.env
 
 # 3. Commit and push.
 $ git add git-agecrypt.toml secrets/api-token secrets/db.env
@@ -356,8 +408,8 @@ $ git checkout -- secrets/   # smudge filter decrypts on checkout
 
 ```console
 $ git-agecrypt config remove -r age1jrnk…2qzp
-# Re-touch every file so it gets re-encrypted to the reduced recipient set.
-$ git ls-files | xargs -I {} sh -c 'grep -q git-agecrypt .gitattributes && cp "{}" "{}.tmp" && mv "{}.tmp" "{}"' || true
+# Re-encrypt every encrypted file to the reduced recipient set.
+$ git-agecrypt rekey
 $ git add -A && git commit -m "revoke bob"
 $ git push
 ```
@@ -405,7 +457,7 @@ $ git-agecrypt init
 $ git-agecrypt config add -i ~/.config/age/personal.key
 $ printf 'shh\n' > secrets/new-token
 $ git-agecrypt config add -r age1qz5y…0p7w -p secrets/new-token
-$ echo 'secrets/new-token filter=git-agecrypt diff=git-agecrypt' >> .gitattributes
+$ echo 'secrets/new-token filter=git-agecrypt diff=git-agecrypt -text' >> .gitattributes
 $ git add .gitattributes git-agecrypt.toml secrets/new-token
 $ git commit -m "encrypted new-token"
 ```
@@ -450,16 +502,11 @@ Git invokes these driver commands per file when `.gitattributes` opts the path i
 - **`smudge`** runs on `git checkout`. Ciphertext from the index is read on stdin; plaintext is written into the working tree.
 - **`textconv`** runs on `git diff` / `git log -p`. The encrypted file is decrypted on the fly so diffs show plaintext.
 
-### Stable ciphertext via blake3 sidecars
+### Stable ciphertext via the cache
 
-Age encryption is non-deterministic: the same plaintext encrypted twice produces two different ciphertexts. Without mitigation, every `git status` / `git add` would create a fresh encrypted blob and show every encrypted file as modified. To avoid this, `clean` keeps two sidecar files per encrypted path under `.git/git-agecrypt/`:
+Age encryption is non-deterministic: the same plaintext encrypted twice produces two different ciphertexts. Without mitigation, every `git status` / `git add` would create a fresh encrypted blob and show every encrypted file as modified. To avoid this, `clean` keeps one cache entry per encrypted path under `.git/git-agecrypt/v2/` (named by the blake3 hash of the path, from vlaci/git-agecrypt 0.6): the blake3 hash of the last plaintext, a fingerprint of the recipients, and the ciphertext.
 
-- `<path>.hash` — blake3 hash of the most recent plaintext seen
-- `<path>.age`  — the ciphertext last produced for that plaintext
-
-When `clean` is invoked, it hashes the incoming plaintext. If the hash matches the saved one, the saved ciphertext is emitted verbatim — git sees no change. If the hash differs, `clean` decrypts the version currently in `HEAD` and compares it against the new plaintext; if they're equal, the HEAD ciphertext is reused. Only if both checks fail does the file get re-encrypted with fresh randomness.
-
-`smudge` populates these sidecars too, so the next `clean` on the same plaintext short-circuits.
+When `clean` sees the same plaintext for the same recipients, it emits the cached ciphertext verbatim: git sees no change. Otherwise it reuses the `HEAD` ciphertext when that decrypts to the same plaintext and the recipients are unchanged. Only then does it re-encrypt. A recipient change therefore re-encrypts every file this worktree touches; `rekey` forces the rest. `smudge` fills the cache too. `.hash` / `.age` sidecars from earlier versions are left unused.
 
 ### Where things are stored
 
@@ -468,14 +515,14 @@ When `clean` is invoked, it hashes the incoming plaintext. If the hash matches t
 | `git-agecrypt.toml` (repo root) | path → recipient mappings | **Yes** — committed and shared |
 | `.gitattributes` | which paths use the filter | **Yes** — committed and shared |
 | `.git/config` (filter wiring) | absolute path to the binary | No |
-| `.git/config` (`[git-agecrypt "config"] identity`) | paths to *your* private keys | No |
-| `.git/git-agecrypt/*.{hash,age}` | per-file ciphertext + plaintext-hash cache | No |
+| `.git/config` (`[git-agecrypt "config"] identity`, `identityCommand`) | paths to *your* private keys, or commands that print them | No |
+| `.git/git-agecrypt/v2/*` (per worktree) | per-file ciphertext, plaintext hash, recipients | No |
 
 Encryption never needs the private key, so `git-agecrypt config add -r` works on a fresh clone before any identity is configured. Decryption of course does — that's what `config add -i` is for.
 
 ## Limitations
 
-- The binary is re-executed once per file per git operation. Repos with thousands of encrypted files will see noticeable overhead. Implementing git's [long-running filter protocol](https://git.kernel.org/pub/scm/git/git.git/tree/Documentation/technical/long-running-process-protocol.txt) would amortize this, but isn't done yet.
+- With the default wiring the binary is re-executed once per file per git operation. Repos with thousands of encrypted files should use `git-agecrypt init --process`, which serves a whole git command from one process.
 - During encrypt / decrypt the whole file is loaded into memory. Don't use this for files that don't fit in RAM.
 - Filters apply to files, not directories. Use `secrets/**`, not `secrets/`, in `.gitattributes`.
 - Removing a recipient does not rewrite git history — old commits remain decryptable by the previous keys. Treat key revocation as a prompt to also rotate the underlying secrets.

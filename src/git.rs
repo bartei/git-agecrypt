@@ -283,6 +283,10 @@ mod tests {
         cmd!("git", "config", "user.name", "A U Thor")
             .dir(git_repo.dir.path())
             .run()?;
+        // A global commit.gpgsign would sign through the developer's agent.
+        cmd!("git", "config", "commit.gpgsign", "false")
+            .dir(git_repo.dir.path())
+            .run()?;
         let path = PathBuf::from("subdir/file.txt");
         let file_contents = "file contents";
 

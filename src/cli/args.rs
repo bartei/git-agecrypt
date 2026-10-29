@@ -13,7 +13,7 @@ pub struct Args {
 #[derive(Subcommand)]
 #[clap(
     after_help = "In addition to the above, The following subcommands are used from git filters:
-    clean, smudge, textconv"
+    clean, smudge, textconv, process"
 )]
 pub enum Commands {
     #[command(flatten)]
@@ -25,7 +25,15 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum PublicCommands {
     /// Set-up repository for use with git-agecrypt
-    Init,
+    Init {
+        /// Also register git's long-running filter process
+        /// (`filter.git-agecrypt.process`): one git-agecrypt per git command
+        /// instead of one per file, so identities and any `identityCommand`
+        /// load once per command. Run `init` again without the flag to go
+        /// back to per-file clean/smudge.
+        #[arg(long)]
+        process: bool,
+    },
 
     /// Display configuration status information
     Status,
@@ -36,6 +44,12 @@ pub enum PublicCommands {
 
     /// Remove repository specific configuration
     Deinit,
+
+    /// Re-encrypt files to the recipients configured
+    Rekey {
+        /// Paths to rekey; all encrypted files when empty
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -75,17 +89,25 @@ pub struct AddConfig {
     /// patterns are accepted without an existing file.
     #[arg(short, long, num_args = 1..)]
     path: Option<Vec<PathBuf>>,
+
+    /// Store the recipients under this name in [keys] and list the name on
+    /// the paths, e.g. `--name teo`
+    #[arg(short, long, requires = "recipient", conflicts_with = "identity")]
+    name: Option<String>,
 }
 
 pub(crate) enum ModifyConfig {
     Identity(PathBuf),
     Recipient(Vec<PathBuf>, Vec<String>),
+    Named(String, Vec<PathBuf>, Vec<String>),
 }
 
 impl From<AddConfig> for ModifyConfig {
     fn from(val: AddConfig) -> Self {
         if let Some(identity) = val.identity {
             Self::Identity(identity)
+        } else if let (Some(recipients), Some(name)) = (val.recipient.clone(), val.name) {
+            Self::Named(name, val.path.unwrap(), recipients)
         } else if let Some(recipients) = val.recipient {
             Self::Recipient(val.path.unwrap(), recipients)
         } else {
@@ -199,6 +221,11 @@ pub enum InternalCommands {
         /// File to show
         path: PathBuf,
     },
+
+    /// Serve clean and smudge for a whole git command
+    /// (filter.<driver>.process), as wired by `init --process`
+    #[command(hide = true)]
+    Process,
 }
 
 pub fn parse_args() -> Args {
@@ -228,6 +255,7 @@ mod tests {
         match ModifyConfig::from(add) {
             ModifyConfig::Identity(p) => assert_eq!(p, PathBuf::from("/tmp/some.key")),
             ModifyConfig::Recipient(..) => panic!("expected identity variant"),
+            ModifyConfig::Named(..) => panic!("expected identity variant"),
         }
     }
 
@@ -256,6 +284,7 @@ mod tests {
                 assert_eq!(recipients, vec!["age1example".to_string()]);
             }
             ModifyConfig::Identity(_) => panic!("expected recipient variant"),
+            ModifyConfig::Named(..) => panic!("expected recipient variant"),
         }
     }
 
@@ -276,6 +305,7 @@ mod tests {
         match ModifyConfig::from(rm) {
             ModifyConfig::Identity(p) => assert_eq!(p, PathBuf::from("/tmp/some.key")),
             ModifyConfig::Recipient(..) => panic!("expected identity variant"),
+            ModifyConfig::Named(..) => panic!("expected identity variant"),
         }
     }
 
@@ -294,6 +324,7 @@ mod tests {
                 assert_eq!(recipients, vec!["age1example".to_string()]);
             }
             ModifyConfig::Identity(_) => panic!("expected recipient variant"),
+            ModifyConfig::Named(..) => panic!("expected recipient variant"),
         }
     }
 
@@ -312,6 +343,7 @@ mod tests {
                 assert!(recipients.is_empty());
             }
             ModifyConfig::Identity(_) => panic!("expected recipient variant"),
+            ModifyConfig::Named(..) => panic!("expected recipient variant"),
         }
     }
 
@@ -350,6 +382,87 @@ mod tests {
         // reject this at parse time.
         let result = Args::try_parse_from(["git-agecrypt", "config", "remove"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn init_parses_with_and_without_process() {
+        let parsed = Args::parse_from(["git-agecrypt", "init"]);
+        let Commands::Public(PublicCommands::Init { process }) = parsed.command else {
+            panic!("expected init");
+        };
+        assert!(!process);
+        let parsed = Args::parse_from(["git-agecrypt", "init", "--process"]);
+        let Commands::Public(PublicCommands::Init { process }) = parsed.command else {
+            panic!("expected init");
+        };
+        assert!(process);
+    }
+
+    #[test]
+    fn rekey_parses_optional_paths() {
+        let parsed = Args::parse_from(["git-agecrypt", "rekey"]);
+        let Commands::Public(PublicCommands::Rekey { paths }) = parsed.command else {
+            panic!("expected rekey");
+        };
+        assert!(paths.is_empty());
+        let parsed = Args::parse_from(["git-agecrypt", "rekey", "secrets/a", "secrets/b"]);
+        let Commands::Public(PublicCommands::Rekey { paths }) = parsed.command else {
+            panic!("expected rekey");
+        };
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("secrets/a"), PathBuf::from("secrets/b")]
+        );
+    }
+
+    #[test]
+    fn add_config_with_name_maps_to_named_variant() {
+        let parsed = Args::parse_from([
+            "git-agecrypt",
+            "config",
+            "add",
+            "--name",
+            "teo",
+            "-r",
+            "age1example",
+            "-p",
+            "secrets/a",
+        ]);
+        let Commands::Public(PublicCommands::Config(ConfigCommands::Add(add))) = parsed.command
+        else {
+            panic!("expected config add");
+        };
+        match ModifyConfig::from(add) {
+            ModifyConfig::Named(name, paths, recipients) => {
+                assert_eq!(name, "teo");
+                assert_eq!(paths, vec![PathBuf::from("secrets/a")]);
+                assert_eq!(recipients, vec!["age1example".to_string()]);
+            }
+            _ => panic!("expected named variant"),
+        }
+    }
+
+    #[test]
+    fn add_config_name_requires_recipient() {
+        // A name only makes sense for recipients: with an identity, or with
+        // nothing but a path, clap must reject it at parse time.
+        for args in [
+            vec!["config", "add", "--name", "teo", "-i", "/tmp/some.key"],
+            vec!["config", "add", "--name", "teo", "-p", "secrets/a"],
+        ] {
+            let mut full = vec!["git-agecrypt"];
+            full.extend(args.iter());
+            assert!(Args::try_parse_from(&full).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn internal_process_command_parses() {
+        let parsed = Args::parse_from(["git-agecrypt", "process"]);
+        assert!(matches!(
+            parsed.command,
+            Commands::Internal(InternalCommands::Process)
+        ));
     }
 
     #[test]

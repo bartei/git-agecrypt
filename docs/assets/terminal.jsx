@@ -19,7 +19,7 @@ const TERMINAL_SCRIPT = [
   { kind: "cmd", text: "git-agecrypt config add \\\n    -r age1qz5y…0p7w \\\n    -p secrets/api-token" },
   { kind: "spacer" },
   { kind: "comment", text: "5. Tell git which paths use the filter" },
-  { kind: "cmd", text: "echo 'secrets/* filter=git-agecrypt diff=git-agecrypt' >> .gitattributes" },
+  { kind: "cmd", text: "echo 'secrets/* filter=git-agecrypt diff=git-agecrypt -text' >> .gitattributes" },
   { kind: "spacer" },
   { kind: "comment", text: "6. Commit. Working copy = plaintext, blob = ciphertext." },
   { kind: "cmd", text: "git add .gitattributes git-agecrypt.toml secrets/api-token" },

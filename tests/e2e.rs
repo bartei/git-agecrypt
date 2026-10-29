@@ -134,7 +134,7 @@ impl Fixture {
         self.run_ok(&["init"]);
         fs::write(
             self.workdir().join(".gitattributes"),
-            "secrets/* filter=git-agecrypt diff=git-agecrypt\n",
+            "secrets/* filter=git-agecrypt diff=git-agecrypt -text\n",
         )
         .unwrap();
     }
@@ -654,7 +654,7 @@ fn glob_recipient_encrypts_matching_files_at_any_depth() {
     fx.add_identity();
     fs::write(
         fx.workdir().join(".gitattributes"),
-        "**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt\n",
+        "**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt -text\n",
     )
     .unwrap();
     fx.run_ok(&[
@@ -719,7 +719,7 @@ fn glob_and_literal_recipients_merge_for_matching_file() {
 
     fs::write(
         fx.workdir().join(".gitattributes"),
-        "**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt\n",
+        "**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt -text\n",
     )
     .unwrap();
 
@@ -919,4 +919,559 @@ fn config_add_invalid_listed_marker_when_identity_breaks() {
         listed.contains("⨯"),
         "broken identity should be marked invalid; got:\n{listed}"
     );
+}
+
+fn staged_bytes(fx: &Fixture, rel: &str) -> Vec<u8> {
+    cmd("git", ["cat-file", "blob", &format!(":{rel}")])
+        .dir(fx.workdir())
+        .stdout_capture()
+        .run()
+        .unwrap()
+        .stdout
+}
+
+fn opens_with(blob: &[u8], identity: &age::x25519::Identity) -> bool {
+    age::Decryptor::new(blob)
+        .and_then(|d| d.decrypt(std::iter::once(identity as &dyn age::Identity)))
+        .is_ok()
+}
+
+#[test]
+fn same_stem_files_keep_their_own_recipients() {
+    // Sidecars named `a.hash` / `a.age` once served both a.json and a.pdf:
+    // equal content got the other file's ciphertext, and its recipients.
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    let other = age::x25519::Identity::generate();
+    fx.write("secrets/a.json", "same");
+    fx.write("secrets/a.pdf", "same");
+    fx.run_ok(&[
+        "config",
+        "add",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "secrets/a.json",
+    ]);
+    let other_pub = other.to_public().to_string();
+    fx.run_ok(&["config", "add", "-r", &other_pub, "-p", "secrets/a.pdf"]);
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/a.json",
+    ]);
+    fx.git(&["add", "secrets/a.pdf"]);
+    assert!(opens_with(&staged_bytes(&fx, "secrets/a.pdf"), &other));
+}
+
+#[test]
+fn rekey_moves_unchanged_files_to_new_recipients() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    fx.write("secrets/s.txt", "secret");
+    fx.add_recipient_for("s.txt");
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/s.txt",
+    ]);
+    fx.git(&["commit", "-m", "secret"]);
+    let other = age::x25519::Identity::generate();
+    let other_pub = other.to_public().to_string();
+    fx.run_ok(&["config", "add", "-r", &other_pub, "-p", "secrets/s.txt"]);
+    assert!(!opens_with(&staged_bytes(&fx, "secrets/s.txt"), &other));
+    assert!(fx.run_ok(&["rekey"]).contains("Re-encrypted secrets/s.txt"));
+    assert!(opens_with(&staged_bytes(&fx, "secrets/s.txt"), &other));
+}
+
+#[test]
+fn process_filter_round_trips() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    // Same normalisation as `init`: git's config parser eats backslashes.
+    let exe = agecrypt_bin().to_str().unwrap().replace('\\', "/");
+    fx.git(&["config", "--unset", "filter.git-agecrypt.clean"]);
+    fx.git(&["config", "--unset", "filter.git-agecrypt.smudge"]);
+    fx.git(&[
+        "config",
+        "filter.git-agecrypt.process",
+        &format!("\"{exe}\" process"),
+    ]);
+    fx.write("secrets/secret.txt", "through the process filter");
+    fx.add_recipient_for("secret.txt");
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/secret.txt",
+    ]);
+    fx.git(&["commit", "-m", "secret"]);
+    assert!(staged_bytes(&fx, "secrets/secret.txt").starts_with(b"age-encryption.org/v1"));
+    fs::remove_file(fx.workdir().join("secrets/secret.txt")).unwrap();
+    fx.git(&["checkout", "--", "secrets/secret.txt"]);
+    assert_eq!(fx.read("secrets/secret.txt"), "through the process filter");
+}
+
+#[test]
+fn key_names_encrypt_to_their_keys_and_edits_keep_comments() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    fx.write("git-agecrypt.toml", "# who reads what\n[config]\n");
+    fx.write("secrets/s.txt", "named");
+    fx.run_ok(&[
+        "config",
+        "add",
+        "--name",
+        "teo",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "secrets/s.txt",
+    ]);
+    let toml = fx.read("git-agecrypt.toml");
+    assert!(toml.contains("# who reads what"), "{toml}");
+    assert!(
+        toml.contains(&format!("teo = \"{}\"", fx.public_key)),
+        "{toml}"
+    );
+    assert!(toml.contains("\"secrets/s.txt\" = [\"teo\"]"), "{toml}");
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        "secrets/s.txt",
+    ]);
+    let secret = fs::read_to_string(&fx.identity_path).unwrap();
+    let identity: age::x25519::Identity = secret.trim().parse().unwrap();
+    assert!(opens_with(&staged_bytes(&fx, "secrets/s.txt"), &identity));
+    // Removing the key itself would leave it granted through the name.
+    let out = fx.run(&["config", "remove", "-r", &fx.public_key]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("[keys] teo"));
+}
+
+// ---------------------------------------------------------------------------
+// Regression and integration coverage for the long-running filter,
+// identityCommand, rekey, key names and the cache upgrade path.
+// ---------------------------------------------------------------------------
+
+/// A command for the platform shell git-agecrypt runs identityCommand with
+/// (`sh -c` on unix, `cmd /C` on Windows) that prints `path`.
+fn print_file_command(path: &Path) -> String {
+    if cfg!(windows) {
+        format!("type \"{}\"", path.display())
+    } else {
+        format!("cat \"{}\"", path.display())
+    }
+}
+
+/// Same, but first appends a line to `counter`, so a test can count how many
+/// times git-agecrypt ran the command.
+fn counting_print_file_command(counter: &Path, path: &Path) -> String {
+    if cfg!(windows) {
+        format!(
+            "echo x>> \"{}\" && type \"{}\"",
+            counter.display(),
+            path.display()
+        )
+    } else {
+        format!(
+            "echo x >> \"{}\" && cat \"{}\"",
+            counter.display(),
+            path.display()
+        )
+    }
+}
+
+fn count_lines(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+}
+
+fn commit_secret(fx: &Fixture, rel: &str, content: &str) {
+    fx.write(&format!("secrets/{rel}"), content);
+    fx.add_recipient_for(rel);
+    fx.git(&[
+        "add",
+        ".gitattributes",
+        "git-agecrypt.toml",
+        &format!("secrets/{rel}"),
+    ]);
+    fx.git(&["commit", "-q", "-m", rel]);
+}
+
+#[test]
+fn init_does_not_wire_the_process_filter_by_default() {
+    let fx = Fixture::new();
+    fx.run_ok(&["init"]);
+    assert!(
+        fx.git_config_get_all("filter.git-agecrypt.process")
+            .is_empty()
+    );
+    assert_eq!(
+        fx.git_config_get_all("filter.git-agecrypt.required"),
+        vec!["true"]
+    );
+}
+
+#[test]
+fn init_process_wires_the_long_running_filter_and_plain_init_unwires_it() {
+    let fx = Fixture::new();
+    fx.run_ok(&["init", "--process"]);
+    let process = fx.git_config_get_all("filter.git-agecrypt.process");
+    assert_eq!(process.len(), 1, "{process:?}");
+    assert!(process[0].ends_with("\" process"), "{process:?}");
+    // clean/smudge stay configured as well; git prefers `process`.
+    assert_eq!(fx.git_config_get_all("filter.git-agecrypt.clean").len(), 1);
+    // Idempotent: a second `init --process` keeps a single entry.
+    fx.run_ok(&["init", "--process"]);
+    assert_eq!(
+        fx.git_config_get_all("filter.git-agecrypt.process").len(),
+        1
+    );
+    fx.run_ok(&["init"]);
+    assert!(
+        fx.git_config_get_all("filter.git-agecrypt.process")
+            .is_empty()
+    );
+    assert_eq!(fx.git_config_get_all("filter.git-agecrypt.clean").len(), 1);
+}
+
+#[test]
+fn process_filter_round_trips_many_files_and_large_content_in_one_git_command() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.run_ok(&["init", "--process"]);
+    fx.add_identity();
+    // Larger than three pkt-line payloads, so chunking is exercised end to end.
+    let big: String = "0123456789abcdef\n".repeat(13_000);
+    fx.write("secrets/big.txt", &big);
+    fx.write("secrets/a.txt", "alpha");
+    fx.write("secrets/b.txt", "beta");
+    fx.add_recipient_for("big.txt");
+    fx.add_recipient_for("a.txt");
+    fx.add_recipient_for("b.txt");
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "three"]);
+    for rel in ["secrets/big.txt", "secrets/a.txt", "secrets/b.txt"] {
+        assert!(
+            staged_bytes(&fx, rel).starts_with(b"age-encryption.org/v1"),
+            "{rel}"
+        );
+        fs::remove_file(fx.workdir().join(rel)).unwrap();
+    }
+    fx.git(&["checkout", "--", "secrets"]);
+    assert_eq!(fx.read("secrets/big.txt"), big);
+    assert_eq!(fx.read("secrets/a.txt"), "alpha");
+    assert_eq!(fx.read("secrets/b.txt"), "beta");
+    // Nothing churns afterwards.
+    assert_eq!(
+        fx.git(&["status", "--porcelain", "--", "secrets"]).trim(),
+        ""
+    );
+}
+
+#[test]
+fn process_filter_failure_fails_the_git_command() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    commit_secret(&fx, "secret.txt", "hello");
+    fx.run_ok(&["init", "--process"]);
+    // Without any identity the smudge request answers status=error and git,
+    // with `required = true`, must refuse the checkout.
+    fx.git(&["config", "--unset-all", "git-agecrypt.config.identity"]);
+    fs::remove_file(fx.workdir().join("secrets/secret.txt")).unwrap();
+    let out = cmd("git", ["checkout", "--", "secrets/secret.txt"])
+        .dir(fx.workdir())
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("git-agecrypt"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn identity_command_supplies_the_key_without_an_identity_file() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.git(&[
+        "config",
+        "--add",
+        "git-agecrypt.config.identityCommand",
+        &print_file_command(&fx.identity_path),
+    ]);
+    commit_secret(&fx, "secret.txt", "from the command");
+    assert!(
+        fx.git_config_get_all("git-agecrypt.config.identity")
+            .is_empty()
+    );
+    fs::remove_file(fx.workdir().join("secrets/secret.txt")).unwrap();
+    fx.git(&["checkout", "--", "secrets/secret.txt"]);
+    assert_eq!(fx.read("secrets/secret.txt"), "from the command");
+    // Named in status output next to file identities.
+    let listed = fx.run_ok(&["config", "list", "-i"]);
+    assert!(listed.contains("identities"), "{listed}");
+}
+
+#[test]
+fn identity_command_runs_once_per_git_command_with_the_process_filter() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    let counter = fx.workdir().join("counter.txt");
+    fx.git(&[
+        "config",
+        "--add",
+        "git-agecrypt.config.identityCommand",
+        &counting_print_file_command(&counter, &fx.identity_path),
+    ]);
+    for rel in ["a.txt", "b.txt", "c.txt"] {
+        fx.write(&format!("secrets/{rel}"), rel);
+        fx.add_recipient_for(rel);
+    }
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "three"]);
+    let remove_all = || {
+        for rel in ["a.txt", "b.txt", "c.txt"] {
+            fs::remove_file(fx.workdir().join("secrets").join(rel)).unwrap();
+        }
+        let _ = fs::remove_file(&counter);
+    };
+    // One process per file: the command runs three times.
+    remove_all();
+    fx.git(&["checkout", "--", "secrets"]);
+    assert_eq!(count_lines(&counter), 3);
+    // One process per git command: it runs once.
+    fx.run_ok(&["init", "--process"]);
+    remove_all();
+    fx.git(&["checkout", "--", "secrets"]);
+    assert_eq!(count_lines(&counter), 1);
+    assert_eq!(fx.read("secrets/c.txt"), "c.txt");
+}
+
+#[test]
+fn identity_command_failure_names_the_command() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    commit_secret(&fx, "secret.txt", "hello");
+    fx.git(&["config", "--unset-all", "git-agecrypt.config.identity"]);
+    fx.git(&[
+        "config",
+        "--add",
+        "git-agecrypt.config.identityCommand",
+        "exit 1",
+    ]);
+    fs::remove_file(fx.workdir().join("secrets/secret.txt")).unwrap();
+    let out = cmd("git", ["checkout", "--", "secrets/secret.txt"])
+        .dir(fx.workdir())
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("identityCommand"), "{stderr}");
+}
+
+#[test]
+fn legacy_sidecar_files_from_older_versions_are_ignored() {
+    // Versions before the v2 cache kept `<path with / as !>.hash` / `.age`
+    // next to the new directory. They must neither be read nor break anything.
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    let legacy = fx.workdir().join(".git/git-agecrypt");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("secrets!secret.txt.hash"), b"not a hash").unwrap();
+    fs::write(legacy.join("secrets!secret.txt.age"), b"not ciphertext").unwrap();
+    commit_secret(&fx, "secret.txt", "hello");
+    assert!(staged_bytes(&fx, "secrets/secret.txt").starts_with(b"age-encryption.org/v1"));
+    fs::remove_file(fx.workdir().join("secrets/secret.txt")).unwrap();
+    fx.git(&["checkout", "--", "secrets/secret.txt"]);
+    assert_eq!(fx.read("secrets/secret.txt"), "hello");
+    assert!(legacy.join("v2").is_dir());
+    assert_eq!(
+        fx.read(".git/git-agecrypt/secrets!secret.txt.age"),
+        "not ciphertext"
+    );
+}
+
+#[test]
+fn corrupt_cache_entry_is_ignored_and_rebuilt_without_index_churn() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    commit_secret(&fx, "secret.txt", "hello");
+    let entry = fx
+        .workdir()
+        .join(".git/git-agecrypt/v2")
+        .join(blake3::hash(b"secrets/secret.txt").to_hex().to_string());
+    assert!(entry.is_file(), "cache entry at {}", entry.display());
+    fs::write(&entry, b"GARBAGE").unwrap();
+    // `git add` re-runs clean: HEAD's ciphertext decrypts to the same
+    // plaintext, so the index must not change, and the entry is repaired.
+    fx.git(&["add", "--renormalize", "secrets/secret.txt"]);
+    assert_eq!(
+        fx.git(&["status", "--porcelain", "--", "secrets"]).trim(),
+        ""
+    );
+    assert!(fs::read(&entry).unwrap().starts_with(b"GACACHE1"));
+}
+
+#[test]
+fn rekey_resolves_paths_relative_to_the_current_directory() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    commit_secret(&fx, "s.txt", "secret");
+    let other = age::x25519::Identity::generate();
+    let other_pub = other.to_public().to_string();
+    fx.run_ok(&["config", "add", "-r", &other_pub, "-p", "secrets/s.txt"]);
+    let out = cmd(agecrypt_bin(), ["rekey", "s.txt"])
+        .dir(fx.workdir().join("secrets"))
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Re-encrypted secrets/s.txt"));
+    assert!(opens_with(&staged_bytes(&fx, "secrets/s.txt"), &other));
+}
+
+#[test]
+fn rekey_errors_when_nothing_under_the_filter_matches() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    fx.write("README.md", "plain");
+    fx.git(&["add", "README.md"]);
+    fx.git(&["commit", "-q", "-m", "plain"]);
+    for args in [
+        vec!["rekey"],
+        vec!["rekey", "README.md"],
+        vec!["rekey", "nope"],
+    ] {
+        let out = fx.run(&args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("no tracked file"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn config_add_keeps_the_existing_toml_layout() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.write("secrets/a.txt", "a");
+    fx.write("secrets/b.txt", "b");
+    let original = format!(
+        "# who reads what\n[config]\n\"secrets/a.txt\" = [\n  \"{}\", # me\n]\n",
+        fx.public_key
+    );
+    fx.write("git-agecrypt.toml", &original);
+    fx.add_recipient_for("b.txt");
+    let toml = fx.read("git-agecrypt.toml");
+    assert!(toml.starts_with(&original), "{toml}");
+    assert!(toml.contains("\"secrets/b.txt\""), "{toml}");
+}
+
+#[test]
+fn unknown_key_name_fails_the_commit_with_a_clear_message() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.add_identity();
+    fx.write("secrets/s.txt", "secret");
+    fx.write(
+        "git-agecrypt.toml",
+        "[config]\n\"secrets/s.txt\" = [\"nobody\"]\n",
+    );
+    let out = cmd("git", ["add", "secrets/s.txt"])
+        .dir(fx.workdir())
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown key name 'nobody'"), "{stderr}");
+}
+
+#[test]
+fn named_keys_appear_in_status_and_remove_by_name_works() {
+    let fx = Fixture::new();
+    fx.install_filter();
+    fx.write("secrets/s.txt", "named");
+    fx.run_ok(&[
+        "config",
+        "add",
+        "--name",
+        "teo",
+        "-r",
+        &fx.public_key,
+        "-p",
+        "secrets/s.txt",
+    ]);
+    let status = fx.run_ok(&["status"]);
+    assert!(status.contains("secrets/s.txt: teo"), "{status}");
+    fx.run_ok(&["config", "remove", "-r", "teo", "-p", "secrets/s.txt"]);
+    let listed = fx.run_ok(&["config", "list", "-r"]);
+    assert!(!listed.contains("secrets/s.txt"), "{listed}");
+}
+
+#[test]
+fn textconv_shows_plain_files_under_the_diff_driver_as_is() {
+    // `diff=git-agecrypt` on a path that is not encrypted (no filter): the
+    // textconv must pass the file through instead of failing the diff.
+    let fx = Fixture::new();
+    fx.run_ok(&["init"]);
+    fs::write(
+        fx.workdir().join(".gitattributes"),
+        "notes/* diff=git-agecrypt\n",
+    )
+    .unwrap();
+    fx.write("notes/n.txt", "one\n");
+    fx.git(&["add", ".gitattributes", "notes/n.txt"]);
+    fx.git(&["commit", "-q", "-m", "notes"]);
+    fx.write("notes/n.txt", "one\ntwo\n");
+    let diff = fx.git(&["diff", "notes/n.txt"]);
+    assert!(diff.contains("+two"), "{diff}");
+}
+
+#[test]
+fn help_lists_rekey_and_the_process_flag() {
+    let fx = Fixture::new();
+    let help = fx.run_ok(&["--help"]);
+    assert!(help.contains("rekey"), "{help}");
+    assert!(
+        !help.contains("\n  process"),
+        "internal command must stay hidden: {help}"
+    );
+    let init_help = fx.run_ok(&["init", "--help"]);
+    assert!(init_help.contains("--process"), "{init_help}");
 }
