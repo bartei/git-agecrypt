@@ -133,6 +133,12 @@ Wires `git-agecrypt` into the current repository as a clean / smudge / textconv 
 $ git-agecrypt init
 ```
 
+With `--process`, `init` also registers git's [long-running filter process](https://git-scm.com/docs/gitattributes#_long_running_filter_process) (`filter.git-agecrypt.process`). git then starts **one** `git-agecrypt` per git command instead of one per file, so identities — and any `identityCommand` — load once per `git checkout` / `git add` rather than once per file. Repos with many encrypted files get noticeably faster. git prefers the process entry when both are configured; run `init` again without the flag to go back to per-file clean/smudge.
+
+```console
+$ git-agecrypt init --process
+```
+
 ### `git-agecrypt deinit`
 
 Removes the filter and diff configuration this tool added, and clears the per-file ciphertext cache under `.git/git-agecrypt/`. **Files committed encrypted stay encrypted in history** — `deinit` only removes the local integration, not the encryption itself.
@@ -191,6 +197,17 @@ The following identities are currently configured:
     ✓ /home/alice/.config/age/personal.key
     ✓ /home/alice/.ssh/id_ed25519
 ```
+
+### `identityCommand` — load an identity from a secret manager
+
+Instead of a key file on disk, `git-agecrypt` can run a command that prints an age identity file and use its output. Set it in `.git/config` (local, never committed); several entries are allowed and combine with `config add -i` identities:
+
+```console
+$ git config --add git-agecrypt.config.identityCommand 'op read "op://Private/git-agecrypt/identity"'
+$ git config --add git-agecrypt.config.identityCommand 'pass show git-agecrypt/identity'
+```
+
+The command runs through `sh -c` on Unix and `cmd /C` on Windows, with stdin closed and stderr attached (so an unlock prompt still reaches you). It runs once per `git-agecrypt` process: once per file with the default wiring, once per git command with `init --process`. A failing command fails the git operation with the command named in the error. The output is held in memory only for the lifetime of the process and zeroed afterwards.
 
 ### `git-agecrypt config add -r <recipient> -p <path>...` — add an encryption recipient
 
@@ -294,6 +311,26 @@ config/*.env        filter=git-agecrypt diff=git-agecrypt -text
 
 > Filters are applied to files, not directories — write `secrets/**` (or list specific files) rather than `secrets/`.
 
+### Key names — `--name` and `[keys]`
+
+Recipients are long and anonymous. `--name` stores them under a name in a `[keys]` table of `git-agecrypt.toml` and lists the **name** on the paths, so the rings read as people:
+
+```console
+$ git-agecrypt config add --name alice -r age1qz5y…0p7w -p secrets/api-token
+$ git-agecrypt config add --name ci -r age1jrnk…2qzp age1c7m9…9xk2 -p secrets/api-token
+```
+
+```toml
+[keys]
+alice = "age1qz5y…0p7w"
+ci = ["age1jrnk…2qzp", "age1c7m9…9xk2"]
+
+[config]
+"secrets/api-token" = ["alice", "ci"]
+```
+
+Names are plain words (letters, digits, `_`, `-`) and may not look like a recipient. Adding `--name` again for an existing name appends to its keys. A name that is listed on a path but missing from `[keys]` fails the commit with `unknown key name`, rather than silently encrypting to fewer people. `config remove -r <name> -p <path>` drops the name from a path; removing one of a name's recipients directly is refused, because the key would stay granted through the name — edit `[keys]` by hand for that. Edits keep the rest of the file as you wrote it: comments, multi-line arrays and unrelated tables survive.
+
 ### `git-agecrypt config remove -r <recipient>` — remove a recipient
 
 Drop a recipient from one or more paths, or from every path it currently appears in. Removing a recipient does **not** rewrite history or re-encrypt existing blobs; it takes effect on the next change to each affected file. Glob entries are removed by passing the same pattern that was registered.
@@ -323,9 +360,18 @@ The following recipients are configured:
     secrets/db.env:    age1qz5y…0p7w
 ```
 
+### `git-agecrypt rekey [<path>...]` — re-encrypt to the current recipients
+
+After adding or removing a recipient, files whose plaintext did not change would keep their old ciphertext (and old recipients) in the index. `rekey` marks the given paths — all encrypted files when none are given — and runs `git add --renormalize` on them, so `clean` encrypts them again to the recipients now in `git-agecrypt.toml`. Paths are pathspecs relative to the current directory, like git's own. Commit afterwards.
+
+```console
+$ git-agecrypt rekey                       # everything under the filter
+$ git-agecrypt rekey secrets/api-token     # just this file
+```
+
 ### Internal subcommands
 
-`git-agecrypt clean`, `smudge`, and `textconv` are invoked by git itself via the filter wiring set up by `init`. You should not need to call them directly. They are hidden from `--help` to keep the user-facing CLI small.
+`git-agecrypt clean`, `smudge`, `textconv` and `process` are invoked by git itself via the filter wiring set up by `init`. You should not need to call them directly. They are hidden from `--help` to keep the user-facing CLI small.
 
 ## Common workflows
 
@@ -476,7 +522,7 @@ Encryption never needs the private key, so `git-agecrypt config add -r` works on
 
 ## Limitations
 
-- The binary is re-executed once per file per git operation. Repos with thousands of encrypted files will see noticeable overhead. Implementing git's [long-running filter protocol](https://git.kernel.org/pub/scm/git/git.git/tree/Documentation/technical/long-running-process-protocol.txt) would amortize this, but isn't done yet.
+- With the default wiring the binary is re-executed once per file per git operation. Repos with thousands of encrypted files should use `git-agecrypt init --process`, which serves a whole git command from one process.
 - During encrypt / decrypt the whole file is loaded into memory. Don't use this for files that don't fit in RAM.
 - Filters apply to files, not directories. Use `secrets/**`, not `secrets/`, in `.gitattributes`.
 - Removing a recipient does not rewrite git history — old commits remain decryptable by the previous keys. Treat key revocation as a prompt to also rotate the underlying secrets.
