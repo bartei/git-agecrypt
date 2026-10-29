@@ -129,7 +129,13 @@ impl<C: Context> CommandContext<C> {
 
             Ok(io::stdout().write_all(&rv)?)
         } else {
-            bail!("Input isn't encrypted")
+            let data = cur.get_ref();
+            let head = &data[..data.len().min(120)];
+            bail!(
+                "Input isn't encrypted (len={}, head={:?})",
+                data.len(),
+                String::from_utf8_lossy(head)
+            )
         }
     }
 
