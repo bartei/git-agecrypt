@@ -101,3 +101,111 @@ pub(crate) fn filtered(root: &Path, paths: &[String]) -> Result<HashSet<String>>
         .map(|t| t[0].clone())
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert_fs::TempDir;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let st = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            st.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+    }
+
+    /// A repo with two tracked files, one under the git-agecrypt filter.
+    fn repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "-q", "--initial-branch=main"]);
+        git(dir.path(), &["config", "user.email", "t@example.com"]);
+        git(dir.path(), &["config", "user.name", "T"]);
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(dir.path().join("secrets/deep")).unwrap();
+        std::fs::write(dir.path().join("secrets/deep/s.txt"), "s").unwrap();
+        std::fs::write(dir.path().join("plain.txt"), "p").unwrap();
+        std::fs::write(
+            dir.path().join(".gitattributes"),
+            "secrets/** filter=git-agecrypt diff=git-agecrypt -text\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    #[test]
+    fn tracked_lists_everything_or_the_given_pathspecs_from_the_root() {
+        let dir = repo();
+        let mut all = tracked(dir.path(), &[]).unwrap();
+        all.sort();
+        assert_eq!(
+            all,
+            vec![".gitattributes", "plain.txt", "secrets/deep/s.txt"]
+        );
+        assert_eq!(
+            tracked(dir.path(), &["secrets"]).unwrap(),
+            vec!["secrets/deep/s.txt"]
+        );
+        // Pathspecs are relative to the directory git runs in; the output is
+        // still relative to the root, which is what `rekey` needs.
+        assert_eq!(
+            tracked(&dir.path().join("secrets/deep"), &["s.txt"]).unwrap(),
+            vec!["secrets/deep/s.txt"]
+        );
+        assert!(tracked(dir.path(), &["nothing-here"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn filtered_keeps_only_paths_under_the_filter() {
+        let dir = repo();
+        let paths: Vec<String> = ["plain.txt", "secrets/deep/s.txt", ".gitattributes"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let kept = filtered(dir.path(), &paths).unwrap();
+        assert_eq!(
+            kept.into_iter().collect::<Vec<_>>(),
+            vec!["secrets/deep/s.txt"]
+        );
+        assert!(filtered(dir.path(), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn run_with_paths_feeds_pathspecs_on_stdin_and_skips_empty_lists() {
+        let dir = repo();
+        run_with_paths(dir.path(), &["add", "--renormalize"], &[]).unwrap();
+        std::fs::write(dir.path().join("plain.txt"), "changed").unwrap();
+        run_with_paths(dir.path(), &["add"], &["plain.txt".to_string()]).unwrap();
+        let out = output(dir.path(), &["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "plain.txt");
+    }
+
+    #[test]
+    fn git_failures_carry_the_command_and_its_stderr() {
+        let dir = repo();
+        let err =
+            run_with_paths(dir.path(), &["no-such-subcommand"], &["x".to_string()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no-such-subcommand"), "{msg}");
+        // Not a repository at all, for both the plain and the stdin-fed paths.
+        let empty = TempDir::new().unwrap();
+        let err = tracked(empty.path(), &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("ls-files"), "{err:#}");
+        let err = filtered(empty.path(), &["x".to_string()]).unwrap_err();
+        assert!(format!("{err:#}").contains("check-attr"), "{err:#}");
+    }
+
+    #[test]
+    fn nul_split_rejects_non_utf8_paths() {
+        assert!(nul_split(b"ok\0\xff\xfe\0").is_err());
+        assert_eq!(nul_split(b"a\0b\0\0").unwrap(), vec!["a", "b"]);
+    }
+}

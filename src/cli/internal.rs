@@ -9,6 +9,7 @@ use std::{
     process::{Command, Stdio},
 };
 
+use ::age::secrecy::{ExposeSecret, SecretString};
 use anyhow::{Context as _, Result, bail};
 
 use crate::{
@@ -47,7 +48,8 @@ impl<C: Context> CommandContext<C> {
     fn load_identities(&self) -> Result<Identities> {
         let mut ids = age::load_identities(&self.get_identities()?)?;
         for command in self.ctx.identity_commands()? {
-            ids.extend(age::identities_from_text(&run_identity_command(&command)?)?);
+            let printed = run_identity_command(&command)?;
+            ids.extend(age::identities_from_text(printed.expose_secret())?);
         }
         Ok(ids)
     }
@@ -148,6 +150,15 @@ impl<C: Context> CommandContext<C> {
         log::info!("Decrypting file");
         let file = self.ctx.repo().workdir().join(file);
 
+        if age::crlf_rewritten(&encrypted) {
+            bail!(
+                "{} looks like an age file whose line endings were rewritten (CRLF), so it \
+                 cannot be decrypted: git treated the ciphertext as text. Add `-text` to the \
+                 path's .gitattributes entry (e.g. `secrets/* filter=git-agecrypt \
+                 diff=git-agecrypt -text`) and check the file out again.",
+                file.display()
+            );
+        }
         let Some(rv) = age::decrypt_with(self.identities()?, &encrypted)? else {
             bail!("Input isn't encrypted")
         };
@@ -181,12 +192,29 @@ impl<C: Context> CommandContext<C> {
     }
 }
 
+/// The shell git itself runs filter commands through: `sh -c` on unix and
+/// `cmd /C` on Windows, where no `sh` can be assumed on PATH.
+fn shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut c = Command::new("cmd");
+        c.arg("/C").raw_arg(command);
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    }
+}
+
 /// Run an `identityCommand` and return what it printed. stderr stays attached
-/// so a secret store can still talk to the user (unlock prompts).
-fn run_identity_command(command: &str) -> Result<String> {
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(command)
+/// so a secret store can still talk to the user (unlock prompts). The output
+/// is key material: it is zeroed when dropped.
+fn run_identity_command(command: &str) -> Result<SecretString> {
+    let out = shell_command(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -195,28 +223,30 @@ fn run_identity_command(command: &str) -> Result<String> {
     if !out.status.success() {
         bail!("identityCommand {command:?} failed ({})", out.status);
     }
-    String::from_utf8(out.stdout).context("identityCommand output is not UTF-8")
+    let text = String::from_utf8(out.stdout).context("identityCommand output is not UTF-8")?;
+    Ok(SecretString::from(text))
 }
 
+/// In-memory `Context` and `Repository` for the filter tests here and in
+/// `process.rs`. Only what `clean_bytes` / `smudge_bytes` reach is
+/// implemented; the rest panics so a new dependency on the repo shows up.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
     use crate::config::{AgeIdentity, AppConfig, Container};
     use crate::ctx::Context as CtxTrait;
     use crate::git;
     use ::age::secrecy::ExposeSecret;
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
-    /// In-memory `Repository` whose only meaningful behaviour is exposing
-    /// a configurable HEAD blob for a path. The other methods are not
-    /// reached by `clean_bytes` so they panic if called — this catches
-    /// regressions where the production code starts depending on them.
-    struct TestRepo {
-        workdir: PathBuf,
-        gitdir: PathBuf,
-        head: RefCell<HashMap<PathBuf, Vec<u8>>>,
+    pub(crate) struct TestRepo {
+        pub workdir: PathBuf,
+        pub gitdir: PathBuf,
+        pub head: RefCell<HashMap<PathBuf, Vec<u8>>>,
+        /// Paths whose HEAD lookup fails like an unreadable object store.
+        pub broken: RefCell<HashSet<PathBuf>>,
     }
 
     impl git::Repository for TestRepo {
@@ -228,6 +258,11 @@ mod tests {
         }
         fn get_file_contents(&self, path: &Path) -> git::Result<Vec<u8>> {
             let rel = path.strip_prefix(&self.workdir).unwrap_or(path);
+            if self.broken.borrow().contains(rel) {
+                return Err(git::Error::Other(anyhow::anyhow!(
+                    "object store unreadable"
+                )));
+            }
             self.head
                 .borrow()
                 .get(rel)
@@ -254,8 +289,8 @@ mod tests {
         }
     }
 
-    struct StaticIdentities {
-        paths: Vec<String>,
+    pub(crate) struct StaticIdentities {
+        pub paths: Vec<String>,
     }
 
     impl Container for StaticIdentities {
@@ -276,11 +311,12 @@ mod tests {
         }
     }
 
-    struct TestContext {
-        repo: TestRepo,
-        cache: RefCell<HashMap<PathBuf, CacheEntry>>,
-        identities: Vec<String>,
-        config_path: PathBuf,
+    pub(crate) struct TestContext {
+        pub repo: TestRepo,
+        pub cache: RefCell<HashMap<PathBuf, CacheEntry>>,
+        pub identities: Vec<String>,
+        pub identity_commands: Vec<String>,
+        pub config_path: PathBuf,
     }
 
     impl CtxTrait for TestContext {
@@ -314,7 +350,7 @@ mod tests {
         }
 
         fn identity_commands(&self) -> Result<Vec<String>> {
-            Ok(vec![])
+            Ok(self.identity_commands.clone())
         }
 
         fn config(&self) -> Result<AppConfig> {
@@ -322,142 +358,348 @@ mod tests {
         }
     }
 
-    const FOO: &str = "secrets/foo";
+    /// The path the fixture's toml grants to its own key.
+    pub(crate) const FOO: &str = "secrets/foo";
 
-    fn keypair() -> (::age::x25519::Identity, String, String) {
+    pub(crate) fn keypair() -> (::age::x25519::Identity, String, String) {
         let id = ::age::x25519::Identity::generate();
         let public = id.to_public().to_string();
         let secret = id.to_string().expose_secret().to_string();
         (id, public, secret)
     }
 
-    fn build_fixture() -> (assert_fs::TempDir, CommandContext<TestContext>, String) {
-        let dir = assert_fs::TempDir::new().unwrap();
-        let workdir = dir.path().to_path_buf();
-        let gitdir = workdir.join(".git");
-        std::fs::create_dir_all(&gitdir).unwrap();
-        std::fs::create_dir_all(workdir.join("secrets")).unwrap();
-
-        let (_id, public_key, secret) = keypair();
-        let id_path = workdir.join("test.key");
-        std::fs::write(&id_path, &secret).unwrap();
-
-        // Recipients for secrets/foo come from the committed toml.
-        let config_path = workdir.join("git-agecrypt.toml");
-        std::fs::write(workdir.join(FOO), "").unwrap();
-        let toml = format!("[config]\n\"{FOO}\" = [\"{public_key}\"]\n");
-        std::fs::write(&config_path, toml).unwrap();
-
-        let ctx = TestContext {
-            repo: TestRepo {
-                workdir: workdir.clone(),
-                gitdir,
-                head: RefCell::new(HashMap::new()),
-            },
-            cache: RefCell::new(HashMap::new()),
-            identities: vec![id_path.to_string_lossy().into_owned()],
-            config_path,
-        };
-        (dir, CommandContext::new(ctx), public_key)
+    /// A command for the platform shell that prints `path`.
+    pub(crate) fn print_file_command(path: &Path) -> String {
+        if cfg!(windows) {
+            format!("type \"{}\"", path.display())
+        } else {
+            format!("cat \"{}\"", path.display())
+        }
     }
 
-    fn cache_entry(
-        cmd: &CommandContext<TestContext>,
-        plain: &[u8],
-        recipients: [u8; 32],
-        ciphertext: &[u8],
-    ) {
-        let target = cmd.ctx.repo.workdir.join(FOO);
-        cmd.ctx.cache.borrow_mut().insert(
-            target,
-            CacheEntry {
-                plaintext_hash: *blake3::hash(plain).as_bytes(),
-                recipients,
-                ciphertext: ciphertext.to_vec(),
-            },
-        );
+    pub(crate) struct Fixture {
+        pub dir: assert_fs::TempDir,
+        pub cmd: CommandContext<TestContext>,
+        pub public_key: String,
+        pub identity_path: PathBuf,
     }
+
+    impl Fixture {
+        pub(crate) fn new() -> Self {
+            let dir = assert_fs::TempDir::new().unwrap();
+            let workdir = dir.path().to_path_buf();
+            let gitdir = workdir.join(".git");
+            std::fs::create_dir_all(&gitdir).unwrap();
+            std::fs::create_dir_all(workdir.join("secrets")).unwrap();
+
+            let (_id, public_key, secret) = keypair();
+            let identity_path = workdir.join("test.key");
+            std::fs::write(&identity_path, &secret).unwrap();
+
+            // Recipients for secrets/foo come from the committed toml.
+            let config_path = workdir.join("git-agecrypt.toml");
+            std::fs::write(workdir.join(FOO), "").unwrap();
+            let toml = format!("[config]\n\"{FOO}\" = [\"{public_key}\"]\n");
+            std::fs::write(&config_path, toml).unwrap();
+
+            let ctx = TestContext {
+                repo: TestRepo {
+                    workdir: workdir.clone(),
+                    gitdir,
+                    head: RefCell::new(HashMap::new()),
+                    broken: RefCell::new(HashSet::new()),
+                },
+                cache: RefCell::new(HashMap::new()),
+                identities: vec![identity_path.to_string_lossy().into_owned()],
+                identity_commands: vec![],
+                config_path,
+            };
+            Self {
+                dir,
+                cmd: CommandContext::new(ctx),
+                public_key,
+                identity_path,
+            }
+        }
+
+        pub(crate) fn target(&self, rel: &str) -> PathBuf {
+            self.cmd.ctx.repo.workdir.join(rel)
+        }
+
+        pub(crate) fn cache_entry(&self, plain: &[u8], recipients: [u8; 32], ciphertext: &[u8]) {
+            self.cmd.ctx.cache.borrow_mut().insert(
+                self.target(FOO),
+                CacheEntry {
+                    plaintext_hash: *blake3::hash(plain).as_bytes(),
+                    recipients,
+                    ciphertext: ciphertext.to_vec(),
+                },
+            );
+        }
+
+        pub(crate) fn cached(&self, rel: &str) -> Option<CacheEntry> {
+            self.cmd.ctx.cache.borrow().get(&self.target(rel)).cloned()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn clean_reuses_cache_while_plaintext_and_recipients_match() {
         // The hot path that keeps `git status` cheap on unchanged files.
-        let (_dir, cmd, pk) = build_fixture();
-        cache_entry(
-            &cmd,
+        let fx = Fixture::new();
+        fx.cache_entry(
             b"hello",
-            cache::recipients_fingerprint(&[pk]),
+            cache::recipients_fingerprint(std::slice::from_ref(&fx.public_key)),
             b"CACHED",
         );
-        let out = cmd.clean_bytes(Path::new(FOO), b"hello".to_vec()).unwrap();
+        let out = fx
+            .cmd
+            .clean_bytes(Path::new(FOO), b"hello".to_vec())
+            .unwrap();
         assert_eq!(out, b"CACHED");
+    }
+
+    #[test]
+    fn clean_upgrades_an_entry_with_unknown_recipients() {
+        // smudge stores UNKNOWN_RECIPIENTS when the toml has no entry yet;
+        // the next clean serves it and records the real fingerprint.
+        let fx = Fixture::new();
+        fx.cache_entry(b"hello", cache::UNKNOWN_RECIPIENTS, b"CACHED");
+        let out = fx
+            .cmd
+            .clean_bytes(Path::new(FOO), b"hello".to_vec())
+            .unwrap();
+        assert_eq!(out, b"CACHED");
+        let fp = cache::recipients_fingerprint(std::slice::from_ref(&fx.public_key));
+        assert_eq!(fx.cached(FOO).unwrap().recipients, fp);
     }
 
     #[test]
     fn clean_re_encrypts_when_recipients_changed() {
         // Same plaintext, cached under another recipient set: reusing it would
         // keep encrypting to a removed key.
-        let (_dir, cmd, _pk) = build_fixture();
-        cache_entry(&cmd, b"hello", [9; 32], b"OLD-RECIPIENTS");
-        let out = cmd.clean_bytes(Path::new(FOO), b"hello".to_vec()).unwrap();
+        let fx = Fixture::new();
+        fx.cache_entry(b"hello", [9; 32], b"OLD-RECIPIENTS");
+        let out = fx
+            .cmd
+            .clean_bytes(Path::new(FOO), b"hello".to_vec())
+            .unwrap();
         assert_ne!(out, b"OLD-RECIPIENTS");
         assert!(out.starts_with(b"age-encryption.org/v1"));
     }
 
     #[test]
     fn clean_encrypts_and_caches_without_head_or_cache() {
-        let (_dir, cmd, pk) = build_fixture();
-        let out = cmd.clean_bytes(Path::new(FOO), b"plain".to_vec()).unwrap();
+        let fx = Fixture::new();
+        let out = fx
+            .cmd
+            .clean_bytes(Path::new(FOO), b"plain".to_vec())
+            .unwrap();
         assert!(out.starts_with(b"age-encryption.org/v1"));
-        let target = cmd.ctx.repo.workdir.join(FOO);
-        let cached = cmd.ctx.cache.borrow().get(&target).cloned().unwrap();
+        let cached = fx.cached(FOO).unwrap();
         assert_eq!(cached.ciphertext, out);
-        assert_eq!(cached.recipients, cache::recipients_fingerprint(&[pk]));
+        assert_eq!(
+            cached.recipients,
+            cache::recipients_fingerprint(std::slice::from_ref(&fx.public_key))
+        );
     }
 
     #[test]
     fn clean_reuses_head_when_it_decrypts_to_the_same_plaintext() {
         // Fresh checkout, no cache: the index must not churn.
-        let (_dir, cmd, pk) = build_fixture();
-        let head_ct = age::encrypt(&[pk], &mut &b"stable"[..]).unwrap();
-        cmd.ctx
+        let fx = Fixture::new();
+        let head_ct =
+            age::encrypt(std::slice::from_ref(&fx.public_key), &mut &b"stable"[..]).unwrap();
+        fx.cmd
+            .ctx
             .repo
             .head
             .borrow_mut()
             .insert(PathBuf::from(FOO), head_ct.clone());
-        let out = cmd.clean_bytes(Path::new(FOO), b"stable".to_vec()).unwrap();
+        let out = fx
+            .cmd
+            .clean_bytes(Path::new(FOO), b"stable".to_vec())
+            .unwrap();
         assert_eq!(out, head_ct);
     }
 
     #[test]
     fn clean_re_encrypts_when_head_plaintext_differs() {
-        let (_dir, cmd, pk) = build_fixture();
-        let head_ct = age::encrypt(&[pk], &mut &b"old"[..]).unwrap();
-        cmd.ctx
+        let fx = Fixture::new();
+        let head_ct = age::encrypt(std::slice::from_ref(&fx.public_key), &mut &b"old"[..]).unwrap();
+        fx.cmd
+            .ctx
             .repo
             .head
             .borrow_mut()
             .insert(PathBuf::from(FOO), head_ct.clone());
-        let out = cmd.clean_bytes(Path::new(FOO), b"new".to_vec()).unwrap();
+        let out = fx.cmd.clean_bytes(Path::new(FOO), b"new".to_vec()).unwrap();
         assert_ne!(out, head_ct);
         assert!(out.starts_with(b"age-encryption.org/v1"));
     }
 
     #[test]
+    fn clean_propagates_head_read_errors() {
+        // Anything but "not in HEAD" must surface, not silently re-encrypt.
+        let fx = Fixture::new();
+        fx.cmd
+            .ctx
+            .repo
+            .broken
+            .borrow_mut()
+            .insert(PathBuf::from(FOO));
+        let err = fx
+            .cmd
+            .clean_bytes(Path::new(FOO), b"x".to_vec())
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("object store unreadable"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn clean_fails_for_a_path_without_recipients() {
+        let fx = Fixture::new();
+        let err = fx
+            .cmd
+            .clean_bytes(Path::new("secrets/unlisted"), b"x".to_vec())
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("No public key"), "{err:#}");
+    }
+
+    #[test]
     fn smudge_caches_with_the_current_recipients() {
-        let (_dir, cmd, pk) = build_fixture();
-        let ct = age::encrypt(std::slice::from_ref(&pk), &mut &b"secret"[..]).unwrap();
-        let out = cmd.smudge_bytes(Path::new(FOO), ct).unwrap();
+        let fx = Fixture::new();
+        let ct = age::encrypt(std::slice::from_ref(&fx.public_key), &mut &b"secret"[..]).unwrap();
+        let out = fx.cmd.smudge_bytes(Path::new(FOO), ct).unwrap();
         assert_eq!(out, b"secret");
-        let target = cmd.ctx.repo.workdir.join(FOO);
-        let cached = cmd.ctx.cache.borrow().get(&target).cloned().unwrap();
-        assert_eq!(cached.recipients, cache::recipients_fingerprint(&[pk]));
+        assert_eq!(
+            fx.cached(FOO).unwrap().recipients,
+            cache::recipients_fingerprint(std::slice::from_ref(&fx.public_key))
+        );
+    }
+
+    #[test]
+    fn smudge_marks_recipients_unknown_when_the_toml_has_no_entry() {
+        // A checkout before the toml lists the path: cache it anyway, and let
+        // the next clean fill in the fingerprint.
+        let fx = Fixture::new();
+        let ct = age::encrypt(std::slice::from_ref(&fx.public_key), &mut &b"secret"[..]).unwrap();
+        let out = fx
+            .cmd
+            .smudge_bytes(Path::new("secrets/unlisted"), ct)
+            .unwrap();
+        assert_eq!(out, b"secret");
+        assert_eq!(
+            fx.cached("secrets/unlisted").unwrap().recipients,
+            cache::UNKNOWN_RECIPIENTS
+        );
+    }
+
+    #[test]
+    fn smudge_names_the_fix_for_crlf_rewritten_ciphertext() {
+        let fx = Fixture::new();
+        let err = fx
+            .cmd
+            .smudge_bytes(
+                Path::new(FOO),
+                b"age-encryption.org/v1\r\n-> X25519 a\r\n".to_vec(),
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("-text"), "{err:#}");
+    }
+
+    #[test]
+    fn smudge_rejects_plaintext() {
+        let fx = Fixture::new();
+        let err = fx
+            .cmd
+            .smudge_bytes(Path::new(FOO), b"not encrypted".to_vec())
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("isn't encrypted"), "{err:#}");
+    }
+
+    #[test]
+    fn textconv_decrypts_ciphertext_and_passes_plaintext_through() {
+        let fx = Fixture::new();
+        let ct = age::encrypt(std::slice::from_ref(&fx.public_key), &mut &b"secret"[..]).unwrap();
+        let enc = fx.dir.path().join("enc.age");
+        std::fs::write(&enc, ct).unwrap();
+        fx.cmd.textconv(&enc).unwrap();
+        // A working-copy file is plaintext already: shown as is, no error.
+        let plain = fx.dir.path().join("plain.txt");
+        std::fs::write(&plain, "plain").unwrap();
+        fx.cmd.textconv(&plain).unwrap();
+        assert!(fx.cmd.textconv(fx.dir.path().join("missing")).is_err());
     }
 
     #[test]
     fn get_identities_returns_configured_paths() {
-        let (_dir, cmd, _pk) = build_fixture();
-        let ids = cmd.get_identities().unwrap();
+        let fx = Fixture::new();
+        let ids = fx.cmd.get_identities().unwrap();
         assert_eq!(ids.len(), 1);
         assert!(ids[0].ends_with("test.key"));
+    }
+
+    #[test]
+    fn identity_command_supplies_the_identities() {
+        // No identity file configured: the key comes from the command only.
+        let mut fx = Fixture::new();
+        fx.cmd.ctx.identities = vec![];
+        fx.cmd.ctx.identity_commands = vec![print_file_command(&fx.identity_path)];
+        let ct = age::encrypt(std::slice::from_ref(&fx.public_key), &mut &b"secret"[..]).unwrap();
+        assert_eq!(fx.cmd.smudge_bytes(Path::new(FOO), ct).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn identity_command_failure_is_reported_once_per_process() {
+        let mut fx = Fixture::new();
+        fx.cmd.ctx.identities = vec![];
+        fx.cmd.ctx.identity_commands = vec!["exit 1".to_owned()];
+        let ct = age::encrypt(std::slice::from_ref(&fx.public_key), &mut &b"secret"[..]).unwrap();
+        let first = fx.cmd.smudge_bytes(Path::new(FOO), ct.clone()).unwrap_err();
+        assert!(
+            format!("{first:#}").contains("identityCommand"),
+            "{first:#}"
+        );
+        // The cached failure comes back identical instead of re-running.
+        let second = fx.cmd.smudge_bytes(Path::new(FOO), ct).unwrap_err();
+        assert_eq!(format!("{first:#}"), format!("{second:#}"));
+    }
+
+    #[test]
+    fn identity_command_output_must_be_an_identity_file() {
+        let mut fx = Fixture::new();
+        fx.cmd.ctx.identities = vec![];
+        fx.cmd.ctx.identity_commands = vec!["echo not-a-key".to_owned()];
+        let ct = age::encrypt(std::slice::from_ref(&fx.public_key), &mut &b"secret"[..]).unwrap();
+        let err = fx.cmd.smudge_bytes(Path::new(FOO), ct).unwrap_err();
+        assert!(format!("{err:#}").contains("identityCommand"), "{err:#}");
+    }
+
+    #[test]
+    fn run_identity_command_captures_stdout() {
+        let out = run_identity_command("echo hi").unwrap();
+        assert_eq!(out.expose_secret().trim(), "hi");
+    }
+
+    #[test]
+    fn run_identity_command_reports_a_failing_command() {
+        let err = run_identity_command("exit 3").unwrap_err();
+        assert!(format!("{err:#}").contains("failed"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_identity_command_rejects_non_utf8_output() {
+        let err = run_identity_command("printf '\\377'").unwrap_err();
+        assert!(format!("{err:#}").contains("not UTF-8"), "{err:#}");
     }
 }

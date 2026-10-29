@@ -80,6 +80,15 @@ pub(crate) fn identities_from_text(text: &str) -> Result<Vec<Box<dyn Identity>>>
     Ok(ids)
 }
 
+/// True when `data` is an age file whose line endings were rewritten to CRLF.
+/// git does that to blobs it takes for text (a short ciphertext with no NUL or
+/// control byte) when `core.autocrlf` is on and the path is not `-text`; the
+/// result is not valid age any more.
+pub(crate) fn crlf_rewritten(data: &[u8]) -> bool {
+    data.starts_with(b"age-encryption.org/v1\r\n")
+        || data.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----\r\n")
+}
+
 pub(crate) fn load_identities(identities: &[impl AsRef<Path>]) -> Result<Vec<Box<dyn Identity>>> {
     // age::cli_common::read_identities takes Vec<String>, so the path has
     // to round-trip through UTF-8. Lossy conversion would silently change
@@ -261,22 +270,6 @@ mod tests {
     }
 
     #[test]
-    fn crlf_rewritten_detects_both_age_formats() {
-        assert!(crlf_rewritten(
-            b"age-encryption.org/v1\r\n-> X25519 abc\r\n"
-        ));
-        assert!(crlf_rewritten(
-            b"-----BEGIN AGE ENCRYPTED FILE-----\r\nYWdl\r\n"
-        ));
-        assert!(!crlf_rewritten(b"age-encryption.org/v1\n-> X25519 abc\n"));
-        assert!(!crlf_rewritten(
-            b"-----BEGIN AGE ENCRYPTED FILE-----\nYWdl\n"
-        ));
-        assert!(!crlf_rewritten(b"plain text\r\n"));
-        assert!(!crlf_rewritten(b""));
-    }
-
-    #[test]
     fn validate_public_keys_accepts_x25519() {
         let (_id, public, _) = keypair();
         validate_public_keys(&[public]).unwrap();
@@ -395,5 +388,113 @@ mod tests {
     fn identities_from_text_refuses_output_without_identity() {
         assert!(identities_from_text("").is_err());
         assert!(identities_from_text("# only a comment\n").is_err());
+    }
+
+    #[test]
+    fn crlf_rewritten_detects_both_age_formats() {
+        assert!(crlf_rewritten(
+            b"age-encryption.org/v1\r\n-> X25519 abc\r\n"
+        ));
+        assert!(crlf_rewritten(
+            b"-----BEGIN AGE ENCRYPTED FILE-----\r\nYWdl\r\n"
+        ));
+        assert!(!crlf_rewritten(b"age-encryption.org/v1\n-> X25519 abc\n"));
+        assert!(!crlf_rewritten(
+            b"-----BEGIN AGE ENCRYPTED FILE-----\nYWdl\n"
+        ));
+        assert!(!crlf_rewritten(b"plain text\r\n"));
+        assert!(!crlf_rewritten(b""));
+    }
+
+    /// An identity that errors when asked to unwrap, the way a plugin identity
+    /// does when its plugin is missing: a passphrase-protected identity file
+    /// with no callback that could supply the passphrase.
+    fn failing_identity() -> Box<dyn Identity> {
+        use ::age::secrecy::SecretString;
+        use std::io::Write;
+        let (_id, _public, secret) = keypair();
+        let mut encrypted = vec![];
+        let mut w = Encryptor::with_user_passphrase(SecretString::from("pw".to_owned()))
+            .wrap_output(&mut encrypted)
+            .unwrap();
+        w.write_all(secret.as_bytes()).unwrap();
+        w.finish().unwrap();
+        let id = ::age::encrypted::Identity::from_buffer(
+            io::Cursor::new(encrypted),
+            None,
+            NoCallbacks,
+            None,
+        )
+        .unwrap()
+        .expect("a passphrase-encrypted identity file");
+        Box::new(id)
+    }
+
+    #[test]
+    fn decrypt_with_tries_the_next_identity_after_a_failing_one() {
+        let (good, public, _) = keypair();
+        let ct = encrypt(&[public], &mut &b"secret"[..]).unwrap();
+        let ids: Vec<Box<dyn Identity>> = vec![failing_identity(), Box::new(good)];
+        assert_eq!(decrypt_with(&ids, &ct).unwrap().unwrap(), b"secret");
+    }
+
+    #[test]
+    fn decrypt_with_reports_the_failure_when_nothing_opens() {
+        let (_good, public, _) = keypair();
+        let ct = encrypt(&[public], &mut &b"secret"[..]).unwrap();
+        let err = decrypt_with(&[failing_identity()], &ct).unwrap_err();
+        assert!(format!("{err:#}").contains("one of them failed"), "{err:#}");
+    }
+
+    #[test]
+    fn decrypt_with_only_wrong_identities_reports_no_matching_keys() {
+        let (_a, public_a, _) = keypair();
+        let (b, _public_b, _) = keypair();
+        let ct = encrypt(&[public_a], &mut &b"secret"[..]).unwrap();
+        let ids: Vec<Box<dyn Identity>> = vec![Box::new(b)];
+        let err = decrypt_with(&ids, &ct).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("one of them failed"), "{msg}");
+        // And with no identity at all the same, instead of a panic or `None`.
+        assert!(decrypt_with(&[], &ct).is_err());
+    }
+
+    #[test]
+    fn decrypt_with_errors_on_malformed_age_headers_instead_of_passing_them_through() {
+        // Looks like age but is not parseable: that must be an error, never
+        // `None` (which callers take for plaintext and would pass through).
+        for header in [
+            &b"age-encryption.org/v1\nthis is not a stanza\n"[..],
+            &b"age-encryption.org/v9\n-> X25519 abc\n--- mac\n"[..],
+        ] {
+            let mut data = header.to_vec();
+            data.extend(std::iter::repeat_n(b'x', 512));
+            let err = decrypt_with(&[], &data).unwrap_err();
+            assert!(format!("{err:#}").contains("Unknown age format"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn decrypt_with_rejects_passphrase_encrypted_input() {
+        use ::age::secrecy::SecretString;
+        use std::io::Write;
+        let mut ct = vec![];
+        let mut w = Encryptor::with_user_passphrase(SecretString::from("pw".to_owned()))
+            .wrap_output(&mut ct)
+            .unwrap();
+        w.write_all(b"secret").unwrap();
+        w.finish().unwrap();
+        let err = decrypt_with(&[], &ct).unwrap_err();
+        assert!(format!("{err:#}").contains("Passphrase"), "{err:#}");
+    }
+
+    #[test]
+    fn encrypt_accepts_an_ssh_ed25519_recipient() {
+        // Throwaway key generated for this test; only the public half exists.
+        let ssh =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJOP0uhCI/Ct0WKbnMnsY6zveQnXo3Vqw6zM6PXW24OL test";
+        let ct = encrypt(&[ssh], &mut &b"secret"[..]).unwrap();
+        assert!(ct.starts_with(b"age-encryption.org/v1"));
+        validate_public_keys(&[ssh]).unwrap();
     }
 }

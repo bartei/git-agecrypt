@@ -188,6 +188,8 @@ mod tests {
     struct FakeRepo {
         workdir: PathBuf,
         gitdir: PathBuf,
+        /// Values returned for any `list_config` query.
+        config_values: Vec<String>,
     }
 
     impl git::Repository for FakeRepo {
@@ -209,8 +211,12 @@ mod tests {
         fn remove_config(&self, _: &str, _: &str) -> git::Result<()> {
             unimplemented!()
         }
-        fn list_config(&self, _: &str) -> git::Result<Vec<String>> {
-            unimplemented!()
+        fn list_config(&self, key: &str) -> git::Result<Vec<String>> {
+            assert!(
+                key.starts_with('^') && key.ends_with('$'),
+                "anchored: {key}"
+            );
+            Ok(self.config_values.clone())
         }
         fn set_config(&self, _: &str, _: &str) -> git::Result<()> {
             unimplemented!()
@@ -225,8 +231,68 @@ mod tests {
         let workdir = dir.path().to_path_buf();
         let gitdir = workdir.join(".git");
         std::fs::create_dir_all(&gitdir).unwrap();
-        let ctx = ContextWrapper::new(FakeRepo { workdir, gitdir });
+        let ctx = ContextWrapper::new(FakeRepo {
+            workdir,
+            gitdir,
+            config_values: vec!["op read op://vault/key".into()],
+        });
         (dir, ctx)
+    }
+
+    #[test]
+    fn identity_commands_come_from_git_config() {
+        let (_dir, ctx) = fake_ctx();
+        assert_eq!(
+            ctx.identity_commands().unwrap(),
+            vec!["op read op://vault/key"]
+        );
+    }
+
+    #[test]
+    fn unreadable_cache_entries_are_ignored_not_fatal() {
+        // A truncated or foreign file in the cache directory (a crash mid-write
+        // of an older version, a stray file) must only cost a re-encryption.
+        let (dir, ctx) = fake_ctx();
+        let target = dir.path().join("secrets/note.txt");
+        ctx.store_cache(&target, &entry(b"x")).unwrap();
+        fs::write(ctx.cache_path(&target).unwrap(), b"GARBAGE").unwrap();
+        assert!(ctx.load_cache(&target).unwrap().is_none());
+        // And a fresh store repairs it.
+        ctx.store_cache(&target, &entry(b"y")).unwrap();
+        assert_eq!(ctx.load_cache(&target).unwrap().unwrap().ciphertext, b"y");
+    }
+
+    #[test]
+    fn store_cache_leaves_no_temp_file_behind() {
+        let (dir, ctx) = fake_ctx();
+        let target = dir.path().join("secrets/note.txt");
+        ctx.store_cache(&target, &entry(b"x")).unwrap();
+        ctx.store_cache(&target, &entry(b"y")).unwrap();
+        let names: Vec<String> = fs::read_dir(ctx.cache_directory())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(!names[0].contains(".tmp"), "{names:?}");
+    }
+
+    #[test]
+    fn cache_paths_outside_the_worktree_are_rejected() {
+        let (_dir, ctx) = fake_ctx();
+        assert!(
+            ctx.load_cache(Path::new("/definitely/elsewhere/x"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remove_sidecar_files_deletes_the_whole_cache() {
+        let (dir, ctx) = fake_ctx();
+        let target = dir.path().join("secrets/note.txt");
+        ctx.store_cache(&target, &entry(b"x")).unwrap();
+        assert!(ctx.sidecar_directory().is_dir());
+        ctx.remove_sidecar_files().unwrap();
+        assert!(!ctx.sidecar_directory().exists());
     }
 
     fn entry(ciphertext: &[u8]) -> CacheEntry {

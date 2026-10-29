@@ -24,15 +24,12 @@ fn run_internal_command(commands: InternalCommands, ctx: impl Context) -> Result
 }
 
 fn run_public_command(commands: PublicCommands, ctx: impl Context) -> Result<()> {
-    if let PublicCommands::Rekey { paths } = commands {
-        return public::rekey(&ctx, paths);
-    }
     let cmd = public::CommandContext::new(ctx);
     match commands {
-        PublicCommands::Rekey { .. } => unreachable!("handled above"),
-        PublicCommands::Init => {
-            cmd.init()?;
+        PublicCommands::Init { process } => {
+            cmd.init(process)?;
         }
+        PublicCommands::Rekey { paths } => cmd.rekey(paths)?,
         PublicCommands::Deinit => {
             cmd.deinit()?;
         }

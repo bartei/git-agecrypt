@@ -3,11 +3,15 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context as _;
+
 use crate::{Result, git};
 
 use crate::config::Validated;
 use crate::git::Repository;
 use crate::{cache::CacheEntry, config::AgeIdentity, ctx::Context, gitcli};
+
+const PROCESS_KEY: &str = "filter.git-agecrypt.process";
 
 pub(crate) struct CommandContext<C: Context> {
     ctx: C,
@@ -18,7 +22,10 @@ impl<C: Context> CommandContext<C> {
         Self { ctx }
     }
 
-    pub(crate) fn init(&self) -> Result<()> {
+    /// Wire the filter and diff drivers. With `process`, also the long-running
+    /// filter: git prefers `filter.<driver>.process` over clean/smudge when
+    /// both are set, so a plain `init` clears any earlier one.
+    pub(crate) fn init(&self, process: bool) -> Result<()> {
         let exe = shell_quote(&self.ctx.current_exe()?);
         let repo = self.ctx.repo();
         ensure_state(repo.set_config("filter.git-agecrypt.required", "true"))?;
@@ -27,6 +34,44 @@ impl<C: Context> CommandContext<C> {
         )?;
         ensure_state(repo.set_config("filter.git-agecrypt.clean", &format!("{exe} clean -f %f")))?;
         ensure_state(repo.set_config("diff.git-agecrypt.textconv", &format!("{exe} textconv")))?;
+        if process {
+            ensure_state(repo.set_config(PROCESS_KEY, &format!("{exe} process")))?;
+        } else {
+            for value in repo.list_config(&format!("^{}$", regex::escape(PROCESS_KEY)))? {
+                ensure_state(repo.remove_config(PROCESS_KEY, &value))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Force re-encryption to the configured recipients, from
+    /// vlaci/git-agecrypt 0.6 (László Vaskó, MPL-2.0): mark the cache, then
+    /// let `git add --renormalize` run clean on every target. `paths` are
+    /// pathspecs relative to the current directory, as for git itself; all
+    /// encrypted files when empty.
+    pub(crate) fn rekey(&self, paths: Vec<PathBuf>) -> Result<()> {
+        let root = self.ctx.repo().workdir().to_path_buf();
+        let cwd = std::env::current_dir().context("Cannot determine current directory")?;
+        let specs: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        let mut targets: Vec<String> = gitcli::filtered(&root, &gitcli::tracked(&cwd, &specs)?)?
+            .into_iter()
+            .collect();
+        targets.sort();
+        if targets.is_empty() {
+            anyhow::bail!("no tracked file under the git-agecrypt filter matches");
+        }
+        for rel in &targets {
+            self.ctx
+                .store_cache(&root.join(rel), &CacheEntry::force_reencrypt())?;
+        }
+        gitcli::run_with_paths(&root, &["add", "--renormalize"], &targets)?;
+        for rel in &targets {
+            println!("Re-encrypted {rel}");
+        }
         Ok(())
     }
 
@@ -119,33 +164,6 @@ impl<C: Context> CommandContext<C> {
     }
 }
 
-/// Force re-encryption to the configured recipients, from vlaci/git-agecrypt
-/// 0.6 (László Vaskó, MPL-2.0): mark the cache, then let `git add
-/// --renormalize` run clean on every target.
-pub(crate) fn rekey<C: Context>(ctx: &C, paths: Vec<PathBuf>) -> Result<()> {
-    let root = ctx.repo().workdir().to_path_buf();
-    let specs: Vec<String> = paths
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
-    let mut targets: Vec<String> = gitcli::filtered(&root, &gitcli::tracked(&root, &specs)?)?
-        .into_iter()
-        .collect();
-    targets.sort();
-    if targets.is_empty() {
-        anyhow::bail!("no tracked file under the git-agecrypt filter matches");
-    }
-    for rel in &targets {
-        ctx.store_cache(&root.join(rel), &CacheEntry::force_reencrypt())?;
-    }
-    gitcli::run_with_paths(&root, &["add", "--renormalize"], &targets)?;
-    for rel in &targets {
-        println!("Re-encrypted {rel}");
-    }
-    Ok(())
-}
-
 fn ensure_state(result: git::Result<()>) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
@@ -181,7 +199,20 @@ fn shell_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::shell_quote;
+    use super::*;
+
+    #[test]
+    fn ensure_state_tolerates_already_exists_and_not_exist() {
+        assert!(ensure_state(Err(git::Error::AlreadyExists("k".into()))).is_ok());
+        assert!(ensure_state(Err(git::Error::NotExist("k".into()))).is_ok());
+        assert!(ensure_state(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn ensure_state_propagates_other_errors() {
+        let err = ensure_state(Err(git::Error::Other(anyhow::anyhow!("boom")))).unwrap_err();
+        assert!(format!("{err:#}").contains("boom"));
+    }
 
     #[test]
     fn quote_wraps_simple_path() {

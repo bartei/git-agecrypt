@@ -46,15 +46,16 @@ fn is_recipient(entry: &str) -> bool {
     entry.starts_with("age1") || entry.starts_with("ssh-")
 }
 
-/// Key names are plain words, never mistaken for a recipient.
+/// Key names are plain words, never mistaken for a recipient. No `.`: a bare
+/// dotted key in TOML is a nested table, so `a.b = "…"` would not round-trip.
 fn validate_key_name(name: &str) -> Result<()> {
     let plain = !name.is_empty()
         && name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
     if !plain || is_recipient(name) {
         return Err(
-            anyhow!("key name '{name}': letters, digits, . _ - only, not a recipient").into(),
+            anyhow!("key name '{name}': letters, digits, _ and - only, not a recipient").into(),
         );
     }
     Ok(())
@@ -102,9 +103,8 @@ impl AppConfig {
         Ok(cfg)
     }
 
-    /// Edit the file in place so comments and other tables (the signed
-    /// policy's `[policy]`) survive. Any edit voids `[signature]`: it is
-    /// dropped, and `git-agecrypt sign` writes a new one.
+    /// Edit the file in place so comments, layout and unrelated tables
+    /// survive; only entries that changed are rewritten.
     pub fn save(&self) -> Result<()> {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
@@ -113,7 +113,6 @@ impl AppConfig {
         };
         let mut doc: toml_edit::DocumentMut =
             text.parse().context("Couldn't parse configuration file")?;
-        doc.remove("signature");
         if self.keys.is_empty() {
             doc.remove("keys");
         } else {
@@ -793,5 +792,217 @@ mod tests {
                 .unwrap()
                 .contains(&pk)
         );
+    }
+
+    #[test]
+    fn key_names_must_be_plain_words() {
+        let (dir, cfg) = fixture();
+        let secret = dir.path().join("secrets/foo");
+        fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        fs::write(&secret, "").unwrap();
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        for bad in [
+            "",
+            "age1abc",
+            "ssh-ed25519",
+            "two words",
+            "tab\there",
+            "dotted.name",
+        ] {
+            let err = app
+                .add_named(
+                    bad.into(),
+                    vec![pubkey()],
+                    vec![PathBuf::from("secrets/foo")],
+                )
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("key name"), "{bad:?}: {err:#}");
+        }
+        // The same check guards a hand-edited file.
+        let err = AppConfig::parse(&format!(
+            "[keys]\n\"age1abc\" = \"{}\"\n[config]\n",
+            pubkey()
+        ))
+        .err()
+        .expect("a recipient-shaped key name must be rejected");
+        assert!(format!("{err:#}").contains("key name"), "{err:#}");
+        assert!(AppConfig::parse("[keys]\nteo_x-1 = \"age1abc\"\n[config]\n").is_ok());
+    }
+
+    #[test]
+    fn unknown_key_name_fails_resolution() {
+        let (dir, cfg) = fixture();
+        fs::write(&cfg, "[config]\n\"secrets/foo\" = [\"nobody\"]\n").unwrap();
+        let app = AppConfig::load(&cfg, dir.path()).unwrap();
+        let err = app
+            .get_public_keys(&dir.path().join("secrets/foo"))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown key name 'nobody'"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn named_keys_resolve_and_dedup_against_literal_recipients() {
+        let (dir, cfg) = fixture();
+        let (a, b) = (pubkey(), pubkey());
+        fs::write(
+            &cfg,
+            format!(
+                "[keys]\nteo = [\"{a}\", \"{b}\"]\n[config]\n\"secrets/foo\" = [\"teo\", \"{a}\"]\n"
+            ),
+        )
+        .unwrap();
+        let app = AppConfig::load(&cfg, dir.path()).unwrap();
+        assert_eq!(
+            app.get_public_keys(&dir.path().join("secrets/foo"))
+                .unwrap(),
+            vec![a, b]
+        );
+    }
+
+    #[test]
+    fn add_named_accumulates_keys_and_saves_them_as_an_array() {
+        let (dir, cfg) = fixture();
+        let secret = dir.path().join("secrets/foo");
+        fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        fs::write(&secret, "").unwrap();
+        let (a, b) = (pubkey(), pubkey());
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.add_named(
+            "teo".into(),
+            vec![a.clone()],
+            vec![PathBuf::from("secrets/foo")],
+        )
+        .unwrap();
+        app.save().unwrap();
+        let text = fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains(&format!("teo = \"{a}\"")), "{text}");
+        // Second recipient under the same name: One becomes Many, no dup.
+        app.add_named(
+            "teo".into(),
+            vec![b.clone(), a.clone()],
+            vec![PathBuf::from("secrets/foo")],
+        )
+        .unwrap();
+        app.save().unwrap();
+        let text = fs::read_to_string(&cfg).unwrap();
+        assert!(
+            text.contains(&format!("teo = [\"{a}\", \"{b}\"]")),
+            "{text}"
+        );
+        let reloaded = AppConfig::load(&cfg, dir.path()).unwrap();
+        assert_eq!(
+            reloaded
+                .get_public_keys(&dir.path().join("secrets/foo"))
+                .unwrap(),
+            vec![a, b]
+        );
+        // The ring lists the name once, not per call.
+        assert_eq!(
+            reloaded.list(),
+            vec![("secrets/foo".to_string(), "teo".to_string())]
+        );
+    }
+
+    #[test]
+    fn save_places_keys_above_config_and_keeps_the_rest() {
+        let (dir, cfg) = fixture();
+        let (a, b) = (pubkey(), pubkey());
+        let secret = dir.path().join("secrets/foo");
+        fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        fs::write(&secret, "").unwrap();
+        // [keys] after [config], a comment, and an unrelated table.
+        fs::write(
+            &cfg,
+            format!(
+                "# ring\n[config]\n\"secrets/foo\" = [\n  \"{a}\", # alice\n]\n\n[other]\nx = 1\n\n[keys]\nbob = \"{b}\"\n"
+            ),
+        )
+        .unwrap();
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.add(vec!["bob".into()], vec![PathBuf::from("secrets/foo")])
+            .unwrap();
+        app.save().unwrap();
+        let text = fs::read_to_string(&cfg).unwrap();
+        assert!(
+            text.find("[keys]").unwrap() < text.find("[config]").unwrap(),
+            "{text}"
+        );
+        assert!(text.contains("# ring"), "{text}");
+        assert!(text.contains("[other]\nx = 1"), "{text}");
+        assert!(text.contains(&format!("bob = \"{b}\"")), "{text}");
+        let reloaded = AppConfig::load(&cfg, dir.path()).unwrap();
+        assert_eq!(
+            reloaded
+                .get_public_keys(&dir.path().join("secrets/foo"))
+                .unwrap(),
+            vec![a, b]
+        );
+    }
+
+    #[test]
+    fn save_keeps_untouched_entries_byte_for_byte() {
+        let (dir, cfg) = fixture();
+        let (a, b) = (pubkey(), pubkey());
+        for f in ["secrets/foo", "secrets/bar"] {
+            let p = dir.path().join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, "").unwrap();
+        }
+        let original =
+            format!("[config]\n# multi-line stays\n\"secrets/foo\" = [\n  \"{a}\",\n]\n");
+        fs::write(&cfg, &original).unwrap();
+        let _g = CwdGuard::enter(dir.path());
+        let mut app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.add(vec![b.clone()], vec![PathBuf::from("secrets/bar")])
+            .unwrap();
+        app.save().unwrap();
+        let text = fs::read_to_string(&cfg).unwrap();
+        assert!(text.starts_with(&original), "{text}");
+        assert!(
+            text.contains(&format!("\"secrets/bar\" = [\"{b}\"]")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn save_drops_an_empty_keys_table_and_creates_the_file_when_missing() {
+        let (dir, cfg) = fixture();
+        fs::write(&cfg, "[keys]\n[config]\n").unwrap();
+        let app = AppConfig::load(&cfg, dir.path()).unwrap();
+        app.save().unwrap();
+        assert!(!fs::read_to_string(&cfg).unwrap().contains("[keys]"));
+        // No file at all: save writes one.
+        let fresh = dir.path().join("sub/git-agecrypt.toml");
+        fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+        let app = AppConfig::load(&fresh, dir.path()).unwrap();
+        app.save().unwrap();
+        assert!(fresh.is_file());
+    }
+
+    #[test]
+    fn load_and_save_report_unreadable_or_unwritable_files() {
+        let (dir, _cfg) = fixture();
+        // A directory where the file should be: neither readable nor writable
+        // as a config file, and not "missing" either.
+        let as_dir = dir.path().join("git-agecrypt.toml");
+        fs::create_dir_all(&as_dir).unwrap();
+        let err = AppConfig::load(&as_dir, dir.path())
+            .err()
+            .expect("a directory is not a readable config file");
+        assert!(format!("{err:#}").contains("configuration file"), "{err:#}");
+        let mut app = AppConfig::load(&dir.path().join("none.toml"), dir.path()).unwrap();
+        app.path = as_dir;
+        assert!(app.save().is_err());
+        // Missing parent directory: the write itself fails.
+        let mut app = AppConfig::load(&dir.path().join("none.toml"), dir.path()).unwrap();
+        app.path = dir.path().join("missing-dir/git-agecrypt.toml");
+        let err = app.save().unwrap_err();
+        assert!(format!("{err:#}").contains("Couldn't save"), "{err:#}");
     }
 }

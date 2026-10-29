@@ -15,6 +15,7 @@ use crate::ctx::Context;
 /// Largest pkt-line payload: 65520 bytes minus the 4-byte length header.
 const MAX_PAYLOAD: usize = 65516;
 
+#[derive(Debug)]
 enum Pkt {
     Flush,
     Data(Vec<u8>),
@@ -106,12 +107,21 @@ fn handshake(r: &mut impl Read, w: &mut impl Write) -> Result<()> {
     Ok(w.flush()?)
 }
 
-/// Serve requests until git closes the pipe.
+/// Serve requests on stdin/stdout until git closes the pipe.
 pub(crate) fn serve<C: Context>(cmd: &CommandContext<C>) -> Result<()> {
     let mut r = BufReader::new(io::stdin().lock());
     let mut w = BufWriter::new(io::stdout().lock());
-    handshake(&mut r, &mut w)?;
-    while let Some(headers) = read_list(&mut r)? {
+    serve_io(cmd, &mut r, &mut w)
+}
+
+/// The protocol itself, over any pair of streams.
+fn serve_io<C: Context>(
+    cmd: &CommandContext<C>,
+    r: &mut impl Read,
+    w: &mut impl Write,
+) -> Result<()> {
+    handshake(r, w)?;
+    while let Some(headers) = read_list(r)? {
         let get = |key: &str| {
             headers
                 .iter()
@@ -120,7 +130,7 @@ pub(crate) fn serve<C: Context>(cmd: &CommandContext<C>) -> Result<()> {
         };
         let command = get("command").context("filter request without command")?;
         let path = get("pathname").context("filter request without pathname")?;
-        let content = read_content(&mut r)?;
+        let content = read_content(r)?;
         let result = match command.as_str() {
             "clean" => cmd.clean_bytes(Path::new(&path), content),
             "smudge" => cmd.smudge_bytes(Path::new(&path), content),
@@ -128,16 +138,16 @@ pub(crate) fn serve<C: Context>(cmd: &CommandContext<C>) -> Result<()> {
         };
         match result {
             Ok(out) => {
-                write_text(&mut w, "status=success")?;
-                write_flush(&mut w)?;
-                write_content(&mut w, &out)?;
+                write_text(w, "status=success")?;
+                write_flush(w)?;
+                write_content(w, &out)?;
                 // An empty trailing list keeps "status=success".
-                write_flush(&mut w)?;
+                write_flush(w)?;
             }
             Err(e) => {
                 log::error!("{command} {path}: {e:#}");
-                write_text(&mut w, "status=error")?;
-                write_flush(&mut w)?;
+                write_text(w, "status=error")?;
+                write_flush(w)?;
             }
         }
         w.flush()?;
@@ -148,6 +158,187 @@ pub(crate) fn serve<C: Context>(cmd: &CommandContext<C>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::internal::testing::{FOO, Fixture};
+
+    /// What git sends: a pkt-line conversation, assembled in memory.
+    struct Client {
+        buf: Vec<u8>,
+    }
+
+    impl Client {
+        fn new() -> Self {
+            let mut c = Client { buf: vec![] };
+            c.list(&["git-filter-client", "version=2"]);
+            c.list(&["capability=clean", "capability=smudge", "capability=delay"]);
+            c
+        }
+        fn list(&mut self, lines: &[&str]) -> &mut Self {
+            for l in lines {
+                write_text(&mut self.buf, l).unwrap();
+            }
+            write_flush(&mut self.buf).unwrap();
+            self
+        }
+        fn request(&mut self, command: &str, path: &str, content: &[u8]) -> &mut Self {
+            let (c, p) = (format!("command={command}"), format!("pathname={path}"));
+            self.list(&[&c, &p]);
+            write_content(&mut self.buf, content).unwrap();
+            self
+        }
+    }
+
+    /// The server's answers, split into (status lines, content) per request,
+    /// after the two handshake lists.
+    fn responses(mut out: &[u8]) -> Vec<(Vec<String>, Vec<u8>)> {
+        let hello = read_list(&mut out).unwrap().unwrap();
+        assert_eq!(hello, vec!["git-filter-server", "version=2"]);
+        let caps = read_list(&mut out).unwrap().unwrap();
+        assert_eq!(caps, vec!["capability=clean", "capability=smudge"]);
+        let mut all = vec![];
+        while let Some(status) = read_list(&mut out).unwrap() {
+            if status.iter().any(|s| s == "status=success") {
+                let content = read_content(&mut out).unwrap();
+                let trailer = read_list(&mut out).unwrap().unwrap();
+                assert!(trailer.is_empty());
+                all.push((status, content));
+            } else {
+                all.push((status, vec![]));
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn serves_clean_then_smudge_in_one_session() {
+        let fx = Fixture::new();
+        let mut client = Client::new();
+        client.request("clean", FOO, b"plain");
+        let mut out = vec![];
+        serve_io(&fx.cmd, &mut &client.buf[..], &mut out).unwrap();
+        let r = responses(&out);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].1.starts_with(b"age-encryption.org/v1"));
+        let ciphertext = r[0].1.clone();
+
+        let mut client = Client::new();
+        client.request("smudge", FOO, &ciphertext);
+        client.request("clean", FOO, b"plain");
+        let mut out = vec![];
+        serve_io(&fx.cmd, &mut &client.buf[..], &mut out).unwrap();
+        let r = responses(&out);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].1, b"plain");
+        // Same plaintext again: served from the cache the smudge just filled.
+        assert_eq!(r[1].1, ciphertext);
+    }
+
+    #[test]
+    fn a_failing_request_answers_status_error_and_the_session_goes_on() {
+        let fx = Fixture::new();
+        let mut client = Client::new();
+        client.request("smudge", FOO, b"not age at all");
+        client.request("frobnicate", FOO, b"");
+        client.request("clean", FOO, b"after errors");
+        let mut out = vec![];
+        serve_io(&fx.cmd, &mut &client.buf[..], &mut out).unwrap();
+        let r = responses(&out);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].0, vec!["status=error"]);
+        assert_eq!(r[1].0, vec!["status=error"]);
+        assert!(r[2].1.starts_with(b"age-encryption.org/v1"));
+    }
+
+    #[test]
+    fn content_larger_than_one_packet_round_trips_through_the_server() {
+        let fx = Fixture::new();
+        let big = vec![b'z'; MAX_PAYLOAD * 3 + 17];
+        let mut client = Client::new();
+        client.request("clean", FOO, &big);
+        let mut out = vec![];
+        serve_io(&fx.cmd, &mut &client.buf[..], &mut out).unwrap();
+        let ct = responses(&out).remove(0).1;
+        assert!(ct.len() > MAX_PAYLOAD);
+        let mut client = Client::new();
+        client.request("smudge", FOO, &ct);
+        let mut out = vec![];
+        serve_io(&fx.cmd, &mut &client.buf[..], &mut out).unwrap();
+        assert_eq!(responses(&out).remove(0).1, big);
+    }
+
+    #[test]
+    fn requests_without_command_or_pathname_are_rejected() {
+        let fx = Fixture::new();
+        let mut client = Client::new();
+        client.list(&["pathname=x"]);
+        let mut out = vec![];
+        let err = serve_io(&fx.cmd, &mut &client.buf[..], &mut out).unwrap_err();
+        assert!(format!("{err:#}").contains("without command"), "{err:#}");
+        let mut client = Client::new();
+        client.list(&["command=clean"]);
+        let err = serve_io(&fx.cmd, &mut &client.buf[..], &mut out).unwrap_err();
+        assert!(format!("{err:#}").contains("without pathname"), "{err:#}");
+    }
+
+    #[test]
+    fn handshake_rejects_other_clients_and_protocol_versions() {
+        let fx = Fixture::new();
+        let mut out = vec![];
+        let mut c = Client { buf: vec![] };
+        c.list(&["git-filter-client", "version=3"]);
+        let err = serve_io(&fx.cmd, &mut &c.buf[..], &mut out).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unsupported filter protocol"),
+            "{err:#}"
+        );
+        let mut c = Client { buf: vec![] };
+        c.list(&["something-else", "version=2"]);
+        assert!(serve_io(&fx.cmd, &mut &c.buf[..], &mut out).is_err());
+        // No handshake at all.
+        assert!(serve_io(&fx.cmd, &mut &b""[..], &mut out).is_err());
+        // Handshake but no capabilities.
+        let mut c = Client { buf: vec![] };
+        c.list(&["git-filter-client", "version=2"]);
+        let err = serve_io(&fx.cmd, &mut &c.buf[..], &mut out).unwrap_err();
+        assert!(format!("{err:#}").contains("no capabilities"), "{err:#}");
+    }
+
+    #[test]
+    fn only_the_capabilities_git_offers_are_announced() {
+        let fx = Fixture::new();
+        let mut c = Client { buf: vec![] };
+        c.list(&["git-filter-client", "version=2"]);
+        c.list(&["capability=smudge"]);
+        let mut out = vec![];
+        serve_io(&fx.cmd, &mut &c.buf[..], &mut out).unwrap();
+        let mut o = &out[..];
+        read_list(&mut o).unwrap();
+        assert_eq!(
+            read_list(&mut o).unwrap().unwrap(),
+            vec!["capability=smudge"]
+        );
+    }
+
+    #[test]
+    fn malformed_packets_are_errors() {
+        // A pkt-line shorter than its own header.
+        let err = read_pkt(&mut &b"0003"[..]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unexpected pkt-line"),
+            "{err:#}"
+        );
+        // Not hex.
+        assert!(read_pkt(&mut &b"zzzz"[..]).is_err());
+        // Pipe closed inside a request's header list.
+        let mut buf = vec![];
+        write_text(&mut buf, "command=clean").unwrap();
+        let err = read_list(&mut &buf[..]).unwrap_err();
+        assert!(format!("{err:#}").contains("mid-request"), "{err:#}");
+        // Pipe closed inside content.
+        let mut buf = vec![];
+        write_pkt(&mut buf, b"partial").unwrap();
+        let err = read_content(&mut &buf[..]).unwrap_err();
+        assert!(format!("{err:#}").contains("mid-content"), "{err:#}");
+    }
 
     #[test]
     fn pkt_round_trip_and_flush() {
