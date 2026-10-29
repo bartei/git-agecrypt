@@ -102,7 +102,7 @@ $ git-agecrypt config add \
     -p secrets/api-token
 
 # 5. Tell git which paths the filter applies to. .gitattributes is committed.
-$ echo 'secrets/* filter=git-agecrypt diff=git-agecrypt' >> .gitattributes
+$ echo 'secrets/* filter=git-agecrypt diff=git-agecrypt -text' >> .gitattributes
 
 # 6. Commit. The blob in git is encrypted; your working copy is plaintext.
 $ git add .gitattributes git-agecrypt.toml secrets/api-token
@@ -111,6 +111,13 @@ $ git commit -m "encrypted api-token"
 # 7. Verify: this prints ciphertext (starts with "age-encryption.org/v1").
 $ git show HEAD:secrets/api-token
 ```
+
+> **Always include `-text`.** Age ciphertext is binary, but a short one can
+> happen to contain no NUL or control bytes, and git's text heuristic then
+> treats it as text. With `core.autocrlf=true` (the Git for Windows default)
+> git rewrites its line endings before `smudge` runs, and the checkout fails
+> with "line endings were rewritten (CRLF)". `-text` switches end-of-line
+> conversion off for the path, independently of `core.autocrlf`.
 
 After cloning the repo on another machine, run `git-agecrypt init` once and `git-agecrypt config add -i <path-to-private-key>` — the recipients in `git-agecrypt.toml` are already there. `git checkout` will decrypt back to plaintext automatically.
 
@@ -274,15 +281,15 @@ Resulting `git-agecrypt.toml`:
 **Glob entries pair with `.gitattributes` exactly as literal entries do.** `.gitattributes` decides *which* paths run through the filter; `git-agecrypt.toml` decides *who they're encrypted for*. Both files need to agree:
 
 ```gitattributes
-**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt
+**/terraform.tfstate filter=git-agecrypt diff=git-agecrypt -text
 ```
 
 After the first `config add`, edit `.gitattributes` (a regular committed file) so git knows which paths use this filter:
 
 ```gitattributes
-secrets/**          filter=git-agecrypt diff=git-agecrypt
-config/*.env        filter=git-agecrypt diff=git-agecrypt
-**/*.secret.yaml    filter=git-agecrypt diff=git-agecrypt
+secrets/**          filter=git-agecrypt diff=git-agecrypt -text
+config/*.env        filter=git-agecrypt diff=git-agecrypt -text
+**/*.secret.yaml    filter=git-agecrypt diff=git-agecrypt -text
 ```
 
 > Filters are applied to files, not directories — write `secrets/**` (or list specific files) rather than `secrets/`.
@@ -405,7 +412,7 @@ $ git-agecrypt init
 $ git-agecrypt config add -i ~/.config/age/personal.key
 $ printf 'shh\n' > secrets/new-token
 $ git-agecrypt config add -r age1qz5y…0p7w -p secrets/new-token
-$ echo 'secrets/new-token filter=git-agecrypt diff=git-agecrypt' >> .gitattributes
+$ echo 'secrets/new-token filter=git-agecrypt diff=git-agecrypt -text' >> .gitattributes
 $ git add .gitattributes git-agecrypt.toml secrets/new-token
 $ git commit -m "encrypted new-token"
 ```

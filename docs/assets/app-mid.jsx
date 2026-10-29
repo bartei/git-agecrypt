@@ -70,7 +70,7 @@ $ git-agecrypt config add \\
     -r age1qz5y…0p7w \\
     -p secrets/api-token
 
-$ echo 'secrets/* filter=git-agecrypt diff=git-agecrypt' >> .gitattributes`}</CodeBlock>
+$ echo 'secrets/* filter=git-agecrypt diff=git-agecrypt -text' >> .gitattributes`}</CodeBlock>
 
         <h3 style={{margin: "32px 0 6px", fontSize: 18, fontWeight: 500, letterSpacing: "-0.01em"}}>
           <span style={{color: "var(--muted)", fontFamily: "var(--font-mono)", fontSize: 12, marginRight: 10}}>04</span>
